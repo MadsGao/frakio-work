@@ -4,8 +4,8 @@ import test from 'node:test';
 import { resolveInsideRoot } from './path-boundary.mjs';
 
 test('workspace boundary accepts descendants and rejects POSIX traversal', () => {
-  assert.equal(resolveInsideRoot('/work/root', '/work/root/docs/a.md'), '/work/root/docs/a.md');
-  assert.throws(() => resolveInsideRoot('/work/root', '/work/secret.txt'), { status: 403 });
+  assert.equal(resolveInsideRoot('/work/root', '/work/root/docs/a.md', path.posix), '/work/root/docs/a.md');
+  assert.throws(() => resolveInsideRoot('/work/root', '/work/secret.txt', path.posix), { status: 403 });
 });
 
 test('workspace boundary handles Windows drive paths', () => {
