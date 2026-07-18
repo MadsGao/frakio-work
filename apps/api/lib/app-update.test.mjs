@@ -26,3 +26,20 @@ test('update status maps a GitHub release without network access', async () => {
   assert.equal(status.updateAvailable, true);
   assert.equal(status.asset.name, 'Frakio Work-0.2.0-arm64.dmg');
 });
+
+test('update status falls back to the public releases feed when API rate limited', async () => {
+  const feed = `<?xml version="1.0"?><feed><entry><updated>2026-07-18T11:44:53Z</updated><link rel="alternate" type="text/html" href="https://github.com/MadsGao/frakio-work/releases/tag/v0.2.0"/><content type="html">Beta notes</content></entry></feed>`;
+  const status = await appUpdateStatus({
+    currentVersion: '0.1.0',
+    force: true,
+    packaged: true,
+    platform: 'darwin',
+    arch: 'x64',
+    fetchImpl: async (url) => String(url).endsWith('.atom')
+      ? { ok: true, text: async () => feed }
+      : { ok: false, status: 403 },
+  });
+  assert.equal(status.latestVersion, '0.2.0');
+  assert.equal(status.updateAvailable, true);
+  assert.match(status.asset.browser_download_url, /x64\.dmg$/);
+});

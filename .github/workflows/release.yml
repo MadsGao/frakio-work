@@ -77,4 +77,9 @@ jobs:
         shell: bash
         run: |
           mapfile -d '' release_files < <(find artifacts -type f -print0)
-          gh release create "$TAG" "${release_files[@]}" --prerelease --title "Frakio Work $TAG Beta" --notes-file CHANGELOG.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${release_files[@]}" --clobber
+            gh release edit "$TAG" --prerelease --title "Frakio Work $TAG Beta" --notes-file CHANGELOG.md
+          else
+            gh release create "$TAG" "${release_files[@]}" --prerelease --title "Frakio Work $TAG Beta" --notes-file CHANGELOG.md
+          fi

@@ -1,6 +1,7 @@
 const repository = 'MadsGao/frakio-work';
 const repositoryUrl = `https://github.com/${repository}`;
 const releasesApiUrl = `https://api.github.com/repos/${repository}/releases?per_page=10`;
+const releasesFeedUrl = `${repositoryUrl}/releases.atom`;
 const cacheTtlMs = 15 * 60 * 1000;
 
 let cache = { checkedAt: 0, release: null };
@@ -27,15 +28,50 @@ export function selectReleaseAsset(assets = [], { platform = process.platform, a
     || null;
 }
 
+function decodeFeedText(value = '') {
+  return String(value)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+    .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+async function fetchLatestReleaseFromFeed(fetchImpl) {
+  const response = await fetchImpl(releasesFeedUrl, {
+    headers: { Accept: 'application/atom+xml', 'User-Agent': 'Frakio-Work' },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error(`GitHub Releases feed failed with HTTP ${response.status}.`);
+  const xml = await response.text();
+  const entry = xml.match(/<entry>([\s\S]*?)<\/entry>/)?.[1] || '';
+  const htmlUrl = entry.match(/<link[^>]+rel="alternate"[^>]+href="([^"]+)"/)?.[1] || '';
+  const tag = htmlUrl.match(/\/tag\/([^/?#]+)/)?.[1] || '';
+  if (!tag) throw new Error('GitHub does not have a published Frakio Work release yet.');
+  const version = tag.replace(/^v/i, '');
+  const assetName = (arch) => `Frakio.Work-${version}-${arch}.dmg`;
+  return {
+    tag_name: tag,
+    html_url: htmlUrl,
+    body: decodeFeedText(entry.match(/<content[^>]*>([\s\S]*?)<\/content>/)?.[1] || ''),
+    published_at: entry.match(/<updated>([^<]+)<\/updated>/)?.[1] || '',
+    assets: ['arm64', 'x64'].map((arch) => ({
+      name: assetName(arch),
+      browser_download_url: `${repositoryUrl}/releases/download/${tag}/${assetName(arch)}`,
+    })),
+  };
+}
+
 async function fetchLatestRelease({ force = false, fetchImpl = fetch } = {}) {
   if (!force && cache.release && Date.now() - cache.checkedAt < cacheTtlMs) return cache.release;
   const response = await fetchImpl(releasesApiUrl, {
     headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Frakio-Work' },
     signal: AbortSignal.timeout(15000),
   });
-  if (!response.ok) throw new Error(`GitHub Releases request failed with HTTP ${response.status}.`);
-  const payload = await response.json();
-  const release = (Array.isArray(payload) ? payload : [payload]).find((item) => item && !item.draft);
+  let release = null;
+  if (response.ok) {
+    const payload = await response.json();
+    release = (Array.isArray(payload) ? payload : [payload]).find((item) => item && !item.draft);
+  } else {
+    release = await fetchLatestReleaseFromFeed(fetchImpl);
+  }
   if (!release) throw new Error('GitHub does not have a published Frakio Work release yet.');
   cache = { checkedAt: Date.now(), release };
   return release;
