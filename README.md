@@ -4,7 +4,7 @@
 
 Frakio Work 是面向 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的开源多智能体工作台。它把对话、Agent、模型、MCP、频道、任务、知识库和 Runtime 管理放在同一个本地界面里。
 
-> v0.1.0 是公开 Beta。macOS 安装包尚未经 Apple 签名与公证，首次打开请在 Finder 中右键选择“打开”。
+> v0.1.1 是公开 Beta。macOS 安装包尚未经 Apple 签名与公证，首次打开请在 Finder 中右键选择“打开”。v0.1.0 存在 Runtime API 依赖缺失问题，请使用 v0.1.1 或更新版本。
 
 ![Frakio Work 工作台](docs/assets/frakio-work.png)
 

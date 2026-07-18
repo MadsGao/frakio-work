@@ -1714,26 +1714,15 @@ button:disabled { cursor: not-allowed; opacity: .58; }
   animation: launch-welcome-hold 1.45s ease-in-out forwards;
 }
 .launch-shell {
-  --launch-stage-width: 236px;
-  --launch-welcome-stage-width: 356px;
-  --launch-shell-slide-start: 60px;
   display: grid;
-  grid-template-columns: 92px var(--launch-stage-width);
+  grid-template-columns: 92px minmax(260px, 500px);
   align-items: center;
   gap: 30px;
-  width: fit-content;
+  width: min(622px, calc(100vw - 56px));
   max-width: calc(100vw - 56px);
 }
 .launch-screen.welcome .launch-shell {
-  grid-template-columns: 92px var(--launch-welcome-stage-width);
-  align-items: center;
-  width: fit-content;
-  max-width: calc(100vw - 56px);
-  animation: launch-shell-slide-expand .52s cubic-bezier(.22, 1, .36, 1) both;
-}
-.launch-shell.has-user-avatar {
-  --launch-welcome-stage-width: 416px;
-  --launch-shell-slide-start: 90px;
+  animation: launch-shell-welcome .42s cubic-bezier(.22, 1, .36, 1) both;
 }
 .launch-image-avatar {
   display: grid;
@@ -1750,50 +1739,18 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .launch-fallback-avatar {
   background: #2563eb;
 }
-.launch-content-stage {
-  position: relative;
-  width: var(--launch-stage-width);
-  min-width: 0;
-  min-height: 178px;
-  transition: width .52s cubic-bezier(.22, 1, .36, 1), min-height .52s cubic-bezier(.22, 1, .36, 1);
-}
-.launch-screen.welcome .launch-content-stage {
-  width: var(--launch-welcome-stage-width);
-  min-height: 92px;
-  max-width: min(720px, calc(100vw - 178px));
-  animation: launch-stage-expand .52s cubic-bezier(.22, 1, .36, 1) both;
-}
 .launch-panel {
-  position: absolute;
-  inset: 0 auto auto 0;
   width: 100%;
   min-width: 0;
-  transition: opacity .34s ease, transform .52s cubic-bezier(.22, 1, .36, 1), filter .52s cubic-bezier(.22, 1, .36, 1);
-  will-change: opacity, transform, filter;
+  animation: launch-panel-enter .32s ease-out both;
 }
 .launch-working-panel {
-  opacity: 1;
-  transform: translateX(0) scale(1);
-  filter: blur(0);
+  min-height: 178px;
 }
 .launch-welcome-panel {
   display: grid;
   align-items: center;
   min-height: 92px;
-  opacity: 0;
-  transform: translateX(18px) scale(.98);
-  filter: blur(4px);
-  pointer-events: none;
-}
-.launch-screen.welcome .launch-working-panel {
-  opacity: 0;
-  transform: translateX(-18px) scale(.985);
-  filter: blur(5px);
-}
-.launch-screen.welcome .launch-welcome-panel {
-  opacity: 1;
-  transform: translateX(0) scale(1);
-  filter: blur(0);
 }
 .launch-head {
   display: grid;
@@ -1822,17 +1779,18 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 }
 .launch-welcome {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
   color: #202423;
   font-size: clamp(36px, 4.8vw, 58px);
   font-weight: 720;
-  line-height: 1.15;
+  line-height: 1.25;
   text-align: left;
   justify-content: flex-start;
-  width: var(--launch-welcome-stage-width);
-  max-width: min(720px, calc(100vw - 178px));
+  width: 100%;
+  max-width: 100%;
+  white-space: nowrap;
 }
 .launch-user-avatar {
   display: inline-grid;
@@ -1989,13 +1947,13 @@ button:disabled { cursor: not-allowed; opacity: .58; }
   72% { opacity: 1; }
   100% { opacity: 0; visibility: hidden; }
 }
-@keyframes launch-shell-slide-expand {
-  from { transform: translateX(var(--launch-shell-slide-start)); }
+@keyframes launch-shell-welcome {
+  from { transform: translateX(24px); }
   to { transform: translateX(0); }
 }
-@keyframes launch-stage-expand {
-  from { clip-path: inset(0 32% 0 0 round 18px); }
-  to { clip-path: inset(0 0 0 0 round 18px); }
+@keyframes launch-panel-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 .composer-shell { position: relative; flex: 0 0 auto; padding: 10px 34px 22px; background: linear-gradient(180deg, rgb(255 255 255 / 72%), #fff 28%); }
 .thread-jump-latest {
@@ -3147,9 +3105,26 @@ button:disabled { cursor: not-allowed; opacity: .58; }
   gap: 8px;
 }
 .runtime-autostart strong { color: #202423; font-size: 13px; }
-.runtime-autostart span,
-.runtime-autostart em { color: #7a8782; font-size: 12px; font-style: normal; }
-.runtime-autostart em { color: #a34b3f; white-space: pre-wrap; }
+.runtime-autostart span { color: #7a8782; font-size: 12px; }
+.runtime-autostart-log summary {
+  width: fit-content;
+  cursor: pointer;
+  color: #a34b3f;
+  font-size: 12px;
+  font-weight: 650;
+}
+.runtime-autostart-log pre {
+  max-height: 180px;
+  overflow: auto;
+  margin: 8px 0 0;
+  border-radius: 6px;
+  padding: 10px;
+  color: #7d3028;
+  background: rgb(255 255 255 / 72%);
+  font: 11px/1.5 "Space Mono", ui-monospace, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .runtime-autostart-steps { display: flex; flex-wrap: wrap; gap: 6px; }
 .runtime-autostart-steps span {
   border: 1px solid #e4ebe7;
@@ -3162,6 +3137,36 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .runtime-autostart-steps .ready { color: #0f766e; border-color: #cfe9dd; background: #f3fbf7; }
 .runtime-autostart-steps .running { color: #1d4ed8; border-color: #dbeafe; background: #eff6ff; }
 .runtime-autostart-steps .failed { color: #b42318; border-color: #f1d3cf; background: #fff8f7; }
+.global-search-backdrop { z-index: 140; align-items: flex-start; padding-top: min(14vh, 120px); }
+.global-search-dialog {
+  width: min(680px, calc(100vw - 36px));
+  max-height: min(680px, calc(100vh - 120px));
+  overflow: hidden;
+  border: 1px solid #dfe7e3;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 28px 90px rgb(15 23 42 / 20%);
+}
+.global-search-input {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid #e7ece9;
+  padding: 14px 16px;
+  color: #71807a;
+}
+.global-search-input input { min-width: 0; border: 0; padding: 0; outline: 0; font-size: 16px; background: transparent; }
+.global-search-input button { display: grid; place-items: center; border: 0; border-radius: 6px; padding: 6px; color: #71807a; background: transparent; }
+.global-search-results { overflow: auto; max-height: min(590px, calc(100vh - 190px)); padding: 10px; }
+.global-search-results section { display: grid; gap: 4px; padding: 7px 0; }
+.global-search-results section > strong { padding: 4px 9px; color: #87918d; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+.global-search-results section > button { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 9px; align-items: center; border: 0; border-radius: 8px; padding: 10px; text-align: left; color: #27302d; background: transparent; }
+.global-search-results section > button:hover { background: #f2f7f4; }
+.global-search-results section > button span { display: grid; gap: 2px; min-width: 0; }
+.global-search-results section > button b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.global-search-results section > button small { overflow: hidden; color: #77827e; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.global-search-results section > p { margin: 4px 9px; color: #98a19d; font-size: 12px; }
 .runtime-diagnostics {
   display: grid;
   gap: 6px;
@@ -7282,16 +7287,6 @@ button:disabled { cursor: not-allowed; opacity: .58; }
     transform: none;
     animation: none;
   }
-  .launch-content-stage,
-  .launch-screen.welcome .launch-content-stage {
-    width: 100%;
-    min-height: 178px;
-    padding-bottom: 0;
-    animation: none;
-  }
-  .launch-screen.welcome .launch-content-stage {
-    min-height: 92px;
-  }
   .launch-head,
   .launch-welcome {
     text-align: center;
@@ -7301,6 +7296,7 @@ button:disabled { cursor: not-allowed; opacity: .58; }
     font-size: clamp(28px, 10vw, 42px);
     width: 100%;
     max-width: 100%;
+    white-space: normal;
   }
 }
 
@@ -7308,24 +7304,13 @@ button:disabled { cursor: not-allowed; opacity: .58; }
   .launch-screen,
   .launch-screen.welcome,
   .launch-screen.welcome .launch-shell,
-  .launch-screen.welcome .launch-content-stage,
+  .launch-panel,
   .launch-welcome,
   .task-row.active svg {
     animation: none !important;
   }
   .launch-screen.welcome {
     opacity: 1;
-  }
-  .launch-panel {
-    transition: none !important;
-    filter: none !important;
-  }
-  .launch-screen.welcome .launch-working-panel {
-    opacity: 0;
-  }
-  .launch-screen.welcome .launch-welcome-panel {
-    opacity: 1;
-    transform: none;
   }
 }
 

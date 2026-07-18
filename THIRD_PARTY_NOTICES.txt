@@ -1,11 +1,14 @@
 Third-Party Notices
 ===================
 
-Frakio Work includes Hermes Agent under the MIT License. Bundled Python and Node packages retain their license files inside the release.
+Frakio Work includes Hermes Agent under the MIT License. Bundled Python and Node packages retain their license files inside the release. Bundled Doto, Space Grotesk, and Space Mono font files are distributed through Fontsource under the SIL Open Font License 1.1.
 
 Node dependencies
 -----------------
 
+@fontsource/doto 5.2.10 — OFL-1.1
+@fontsource/space-grotesk 5.2.10 — OFL-1.1
+@fontsource/space-mono 5.2.9 — OFL-1.1
 @types/node 24.13.2 — MIT
 @types/react 19.2.17 — MIT
 @types/react-dom 19.2.3 — MIT
