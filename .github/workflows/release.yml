@@ -75,4 +75,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         shell: bash
-        run: gh release create "$TAG" artifacts/* --prerelease --title "Frakio Work $TAG Beta" --notes-file CHANGELOG.md
+        run: |
+          mapfile -d '' release_files < <(find artifacts -type f -print0)
+          gh release create "$TAG" "${release_files[@]}" --prerelease --title "Frakio Work $TAG Beta" --notes-file CHANGELOG.md
