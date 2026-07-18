@@ -35,8 +35,8 @@
     "runtime:build": "node scripts/build-hermes-runtime.mjs",
     "preview": "npm run preview --workspace @frakio/web",
     "desktop:dev": "FRAKIO_WORK_DESKTOP=1 electron .",
-    "desktop:pack": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --dir",
-    "desktop:dist:mac": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --mac dmg zip",
+    "desktop:pack": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --dir --publish never",
+    "desktop:dist:mac": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --mac dmg zip --publish never",
     "clean": "node scripts/clean-generated.mjs",
     "desktop:clean": "node scripts/clean-generated.mjs"
   },
