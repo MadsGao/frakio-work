@@ -83,14 +83,14 @@
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "build/icon.icns",
-      "artifactName": "Frakio Work-${version}-${arch}.${ext}",
+      "artifactName": "Frakio.Work-${version}-${arch}.${ext}",
       "target": [
         "dmg",
         "zip"
       ]
     },
     "dmg": {
-      "artifactName": "Frakio Work-${version}-${arch}.${ext}"
+      "artifactName": "Frakio.Work-${version}-${arch}.${ext}"
     }
   }
 }
