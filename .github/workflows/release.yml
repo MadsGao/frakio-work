@@ -1,0 +1,78 @@
+name: Release macOS
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Verify tag matches package version
+        shell: bash
+        run: test "v$(node -p "require('./package.json').version")" = "${{ github.event.inputs.tag || github.ref_name }}"
+      - name: Install uv
+        shell: bash
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Build standalone Hermes runtime
+        shell: bash
+        run: PATH="$HOME/.local/bin:$PATH" npm run runtime:build
+      - run: npm run notices:generate
+      - run: npm run desktop:dist:mac
+      - name: Generate checksums and SBOM
+        shell: bash
+        run: |
+          cd release
+          shasum -a 256 *.dmg *.zip > "Frakio-Work-${{ matrix.arch }}-SHA256SUMS.txt"
+          cd ..
+          npm sbom --sbom-format cyclonedx > "release/Frakio-Work-${{ matrix.arch }}-sbom.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*SHA256SUMS.txt
+            release/*sbom.json
+            THIRD_PARTY_NOTICES.txt
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        shell: bash
+        run: gh release create "$TAG" artifacts/* --prerelease --title "Frakio Work $TAG Beta" --notes-file CHANGELOG.md

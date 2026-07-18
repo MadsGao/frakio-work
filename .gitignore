@@ -1,0 +1,36 @@
+# Dependencies and build output
+node_modules/
+dist/
+release/
+dist-electron/
+*.tsbuildinfo
+
+# Generated runtime and packaging inputs
+runtime/hermes/
+.runtime-build/
+build/icon.icns
+build/icon.iconset/
+
+# Local user data and secrets
+data/
+projects/
+.env
+.env.*
+!.env.example
+*.log
+
+# Test and design artifacts
+output/
+.playwright-cli/
+.design-qa/
+preview*.png
+design-qa.md
+playwright-report/
+test-results/
+
+# Operating-system and language caches
+.DS_Store
+**/.DS_Store
+__pycache__/
+*.py[cod]
+.venv/

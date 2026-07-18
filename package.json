@@ -1,0 +1,95 @@
+{
+  "name": "frakio-work",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Frakio Work — an open-source multi-agent workspace for Hermes Agent.",
+  "author": "MadsGao",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MadsGao/frakio-work.git"
+  },
+  "homepage": "https://github.com/MadsGao/frakio-work",
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "apps/desktop",
+    "packages/contracts"
+  ],
+  "type": "module",
+  "main": "apps/desktop/main.cjs",
+  "scripts": {
+    "dev": "concurrently --kill-others-on-fail --prefix \"[{name}]\" --names \"api,web\" \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:web": "npm run dev --workspace @frakio/web",
+    "dev:api": "npm run dev --workspace @frakio/api",
+    "build": "npm run typecheck && npm run build --workspace @frakio/web",
+    "typecheck": "tsc -b",
+    "check:syntax": "node --check apps/api/server.mjs && node --check apps/desktop/main.cjs && node --check bin/hermes-workbench-mcp.mjs",
+    "test": "node --test apps/api/create-app.test.mjs apps/api/telemetry.test.mjs apps/api/lib/app-update.test.mjs apps/api/lib/platform.test.mjs apps/api/lib/path-boundary.test.mjs apps/api/lib/atomic-json-store.test.mjs apps/api/lib/local-security.test.mjs",
+    "test:telemetry": "node --test apps/api/telemetry.test.mjs",
+    "test:smoke": "node scripts/smoke-api.mjs",
+    "test:e2e:release": "node scripts/e2e-release.mjs",
+    "assets:build": "node scripts/build-icon.mjs",
+    "notices:generate": "node scripts/generate-third-party-notices.mjs",
+    "prepare-runtime": "node scripts/prepare-runtime.mjs",
+    "runtime:build": "node scripts/build-hermes-runtime.mjs",
+    "preview": "npm run preview --workspace @frakio/web",
+    "desktop:dev": "FRAKIO_WORK_DESKTOP=1 electron .",
+    "desktop:pack": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --dir",
+    "desktop:dist:mac": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --mac dmg zip",
+    "clean": "node scripts/clean-generated.mjs",
+    "desktop:clean": "node scripts/clean-generated.mjs"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "concurrently": "^9.2.1",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
+    "playwright": "^1.61.1",
+    "typescript": "^5.9.2"
+  },
+  "build": {
+    "appId": "com.frakio.work",
+    "productName": "Frakio Work",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "apps/api/**/*",
+      "!apps/api/**/*.test.mjs",
+      "apps/desktop/**/*",
+      "bin/**/*",
+      "dist/**/*",
+      "runtime/**/*",
+      "scripts/prepare-runtime.mjs",
+      "package.json"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "apps/api/**/*",
+      "bin/**/*",
+      "dist/**/*",
+      "runtime/**/*",
+      "node_modules/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
+      "artifactName": "Frakio Work-${version}-${arch}.${ext}",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "artifactName": "Frakio Work-${version}-${arch}.${ext}"
+    }
+  }
+}
