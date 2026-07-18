@@ -1,6 +1,8 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { cp, mkdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +15,7 @@ const bridgeProtocolVersion = 1;
 const pythonVersion = process.env.FRAKIO_PYTHON_VERSION || '3.12.12';
 const nodeVersion = process.env.FRAKIO_NODE_VERSION || '24.16.0';
 const pinnedHermesTag = process.env.HERMES_AGENT_TAG || 'v2026.7.7.2';
+const aiohttpVersion = '3.14.1';
 
 function platformName() {
   if (process.platform !== 'darwin') throw new Error('Bundled desktop runtimes are built on macOS runners.');
@@ -42,6 +45,73 @@ async function download(url, destination) {
 async function sha256(filePath) {
   const data = await readFile(filePath);
   return createHash('sha256').update(data).digest('hex');
+}
+
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  await new Promise((resolve) => server.close(resolve));
+  if (!port) throw new Error('Unable to allocate a Runtime API self-test port.');
+  return port;
+}
+
+async function verifyRuntimeApi(python, pythonRoot) {
+  const selfTestHome = await mkdtemp(path.join(os.tmpdir(), 'frakio-runtime-self-test-'));
+  const port = await freePort();
+  const apiKey = `frakio_self_test_${randomUUID().replaceAll('-', '')}`;
+  await writeFile(path.join(selfTestHome, 'config.yaml'), '{}\n', 'utf8');
+  await writeFile(path.join(selfTestHome, '.env'), `API_SERVER_KEY=${apiKey}\n`, { encoding: 'utf8', mode: 0o600 });
+  const child = spawn(python, ['-m', 'hermes_cli.main', 'gateway', 'run', '--replace', '--force'], {
+    cwd: selfTestHome,
+    env: {
+      ...process.env,
+      HERMES_HOME: selfTestHome,
+      HERMES_AGENT_ROOT: pythonRoot,
+      API_SERVER_ENABLED: 'true',
+      API_SERVER_HOST: '127.0.0.1',
+      API_SERVER_PORT: String(port),
+      API_SERVER_KEY: apiKey,
+      GATEWAY_ALLOW_ALL_USERS: 'true',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  try {
+    const deadline = Date.now() + 30_000;
+    let response = null;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null) break;
+      try {
+        response = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+          signal: AbortSignal.timeout(1200),
+        });
+        if (response.ok) break;
+      } catch {
+        // The gateway needs a few seconds to initialize on clean CI runners.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+    if (!response?.ok) throw new Error(`Runtime API self-test failed (exit=${child.exitCode ?? 'running'}). ${(stderr || stdout).slice(-1200)}`);
+    await response.json();
+    console.log(`Runtime API self-test passed on 127.0.0.1:${port}.`);
+  } finally {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    await Promise.race([
+      new Promise((resolve) => child.once('exit', resolve)),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
+    if (child.exitCode === null) child.kill('SIGKILL');
+    await rm(selfTestHome, { recursive: true, force: true });
+  }
 }
 
 async function installPortablePython(staging) {
@@ -122,14 +192,17 @@ try {
   const python = await installPortablePython(staging);
   await installPortableNode(staging, downloadsRoot);
   await command(python, ['-m', 'ensurepip', '--upgrade'], { cwd: staging });
-  await command(python, ['-m', 'pip', 'install', '--upgrade', '--force-reinstall', '--no-cache-dir', sourceDir], {
+  await command(python, ['-m', 'pip', 'install', '--upgrade', '--force-reinstall', '--no-cache-dir', sourceDir, `aiohttp==${aiohttpVersion}`], {
     cwd: sourceDir,
     env: { HERMES_AGENT_ROOT: path.join(staging, 'python') },
   });
   await rewritePythonEntrypoints(staging);
   const versionOutput = await command(python, ['-m', 'hermes_cli.main', '--version'], { cwd: staging, timeout: 30000, env: { HERMES_AGENT_ROOT: path.join(staging, 'python') } });
   if (!versionOutput.includes(version)) throw new Error(`Built runtime version mismatch: ${versionOutput}`);
-  await command(python, ['-c', 'import hermes_cli, hermes_cli.main; print("Hermes imports ready")'], { cwd: staging, timeout: 30000 });
+  await command(python, ['-c', `import aiohttp, hermes_cli, hermes_cli.main; assert aiohttp.__version__ == "${aiohttpVersion}"; print("Hermes and aiohttp imports ready")`], { cwd: staging, timeout: 30000 });
+  const bridgeScript = path.join(projectRoot, 'runtime', 'agent-bridge', 'python', 'hermes_bridge.py');
+  await command(python, ['-m', 'py_compile', bridgeScript], { cwd: staging, timeout: 30000 });
+  await verifyRuntimeApi(python, path.join(staging, 'python'));
   const manifest = {
     schema: 1,
     platform,
@@ -141,6 +214,7 @@ try {
     sourceCommit: commit,
     pythonVersion,
     nodeVersion,
+    pythonDependencies: { aiohttp: aiohttpVersion },
     builtAt: new Date().toISOString(),
     bridgeProtocolVersion,
   };

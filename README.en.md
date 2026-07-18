@@ -4,7 +4,7 @@
 
 Frakio Work is an open-source multi-agent workspace for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It brings conversations, agents, models, MCP servers, channels, jobs, knowledge vaults, and runtime management into one local interface.
 
-> v0.1.0 is a public beta. The macOS builds are not yet Apple-signed or notarized. On first launch, right-click the app in Finder and choose **Open**.
+> v0.1.1 is a public beta. The macOS builds are not yet Apple-signed or notarized. On first launch, right-click the app in Finder and choose **Open**. v0.1.0 omitted a Runtime API dependency; use v0.1.1 or newer.
 
 ![Frakio Work workspace](docs/assets/frakio-work.png)
 

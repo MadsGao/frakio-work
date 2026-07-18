@@ -299,13 +299,16 @@ async function stopApi() {
   const processToStop = apiProcess;
   apiProcess = null;
   writeDesktopLog('Stopping API');
+  const exited = new Promise((resolve) => processToStop.once('exit', resolve));
   processToStop.kill('SIGTERM');
-  await wait(1200);
-  if (!processToStop.killed) {
+  await Promise.race([exited, wait(3500)]);
+  if (processToStop.exitCode === null) {
     try {
       processToStop.kill('SIGKILL');
     } catch {}
+    await Promise.race([exited, wait(1000)]);
   }
+  writeDesktopLog(`API stopped exitCode=${processToStop.exitCode ?? 'unknown'} signal=${processToStop.signalCode || 'none'}`);
 }
 
 async function restartApiAndReload() {

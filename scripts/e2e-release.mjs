@@ -22,9 +22,11 @@ try {
   await decline.click();
   await page.waitForTimeout(800);
   assert.equal(await page.getByText('我们接下来做点什么？').count() > 0, true, '工作台主界面未显示');
-  await mkdir('docs/assets', { recursive: true });
   await mkdir('output/playwright', { recursive: true });
-  await page.screenshot({ path: 'docs/assets/frakio-work.png', fullPage: true });
+  if (process.env.FRAKIO_UPDATE_README_SCREENSHOT === '1') {
+    await mkdir('docs/assets', { recursive: true });
+    await page.screenshot({ path: 'docs/assets/frakio-work.png', fullPage: true });
+  }
   await page.screenshot({ path: 'output/playwright/frakio-release-workbench.png', fullPage: true });
   await page.getByRole('button', { name: '打开用户菜单' }).click();
   await page.getByRole('button', { name: '设置', exact: true }).click();

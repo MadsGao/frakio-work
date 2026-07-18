@@ -28,3 +28,26 @@ jobs:
       - run: npm run test:smoke
       - run: npm run build
       - run: npm audit --audit-level=high
+
+  launch-ui:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Start Web UI
+        shell: bash
+        run: |
+          npm run dev:web > /tmp/frakio-web.log 2>&1 &
+          echo $! > /tmp/frakio-web.pid
+          for attempt in {1..60}; do
+            curl -fsS http://127.0.0.1:5173 >/dev/null && exit 0
+            sleep 1
+          done
+          cat /tmp/frakio-web.log
+          exit 1
+      - run: npm run test:e2e:launch

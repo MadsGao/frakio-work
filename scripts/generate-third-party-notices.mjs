@@ -1,8 +1,14 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-const rootPackage = JSON.parse(await readFile('package.json', 'utf8'));
-const names = Object.keys({ ...rootPackage.dependencies, ...rootPackage.devDependencies }).sort();
+const manifests = await Promise.all([
+  'package.json',
+  'apps/web/package.json',
+  'apps/api/package.json',
+  'apps/desktop/package.json',
+  'packages/contracts/package.json',
+].map(async (filePath) => JSON.parse(await readFile(filePath, 'utf8'))));
+const names = [...new Set(manifests.flatMap((manifest) => Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })).filter((name) => !name.startsWith('@frakio/')))].sort();
 const rows = [];
 for (const name of names) {
   try {
@@ -10,6 +16,6 @@ for (const name of names) {
     rows.push(`${name} ${manifest.version || ''} — ${manifest.license || 'SEE PACKAGE'}`);
   } catch {}
 }
-const content = `Third-Party Notices\n===================\n\nFrakio Work includes Hermes Agent under the MIT License. Bundled Python and Node packages retain their license files inside the release.\n\nNode dependencies\n-----------------\n\n${rows.join('\n')}\n`;
+const content = `Third-Party Notices\n===================\n\nFrakio Work includes Hermes Agent under the MIT License. Bundled Python and Node packages retain their license files inside the release. Bundled Doto, Space Grotesk, and Space Mono font files are distributed through Fontsource under the SIL Open Font License 1.1.\n\nNode dependencies\n-----------------\n\n${rows.join('\n')}\n`;
 await writeFile('THIRD_PARTY_NOTICES.txt', content, 'utf8');
 console.log('Generated THIRD_PARTY_NOTICES.txt');

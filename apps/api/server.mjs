@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 import { createTelemetryClient } from './telemetry.mjs';
 import { appUpdateStatus } from './lib/app-update.mjs';
+import { resolveAppVersion } from './lib/app-version.mjs';
 import { createSerialJsonWriter, readJsonWithRecovery } from './lib/atomic-json-store.mjs';
 import { createLocalSecurity } from './lib/local-security.mjs';
 import { resolveInsideRoot } from './lib/path-boundary.mjs';
@@ -46,6 +47,7 @@ const hermesAgentSourcePath = process.env.HERMES_AGENT_SOURCE || path.join(fraki
 const hermesAgentBackupRoot = path.join(frakioWorkHome, 'backups', 'hermes-agent');
 const officialHermesAgentRepo = 'https://github.com/NousResearch/hermes-agent.git';
 const frakioBridgeProtocolVersion = 1;
+const requiredAiohttpVersion = '3.14.1';
 const hermesDbPath = hermesWebUiHome ? path.join(hermesWebUiHome, 'hermes-web-ui.db') : '';
 const telemetry = createTelemetryClient({
   filePath: telemetryPath,
@@ -58,6 +60,7 @@ const writeStateJson = createSerialJsonWriter(statePath, { mode: 0o600 });
 const writeSecretsJson = createSerialJsonWriter(secretsPath, { mode: 0o600 });
 let hermesApiProcess = null;
 let hermesBridgeProcess = null;
+const profileGatewayProcesses = new Set();
 let hermesBridgeLastError = '';
 const apiStartedAtMs = Date.now();
 let hermesAutoStartPromise = null;
@@ -225,7 +228,7 @@ const googleAuthEndpoint = 'https://accounts.google.com/o/oauth2/v2/auth';
 const googleTokenEndpoint = 'https://oauth2.googleapis.com/token';
 const googleUserInfoEndpoint = 'https://www.googleapis.com/oauth2/v1/userinfo?alt=json';
 const googleClientId = process.env.HERMES_GEMINI_CLIENT_ID?.trim() || `681255809395-${['oo8ft2opr', 'drnp9e3a', 'qf6av3h', 'mdib135j'].join('')}.apps.googleusercontent.com`;
-const googleClientSecret = process.env.HERMES_GEMINI_CLIENT_SECRET?.trim() || ['GOC', 'SPX', '-4uHgMPm', '-1o7Sk', '-geV6', 'Cu5clXFsxl'].join('');
+const googleClientSecret = process.env.HERMES_GEMINI_CLIENT_SECRET?.trim() || '';
 const googleScopes = ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile'].join(' ');
 const modelPricingDefaults = [
   { pattern: /gpt-5/i, input: 1.25, output: 10, cacheRead: 0.125, cacheCreation: 1.25 },
@@ -2322,6 +2325,10 @@ function normalizeJob(job) {
 function hermesCommandCandidates() {
   const candidates = [];
   if (process.env.HERMES_BIN) candidates.push({ command: process.env.HERMES_BIN, args: [], cwd: projectRoot });
+  const frakioRuntime = findFrakioHermesRuntimeSync();
+  if (frakioRuntime?.python) {
+    candidates.push({ command: frakioRuntime.python, args: ['-m', 'hermes_cli.main'], cwd: hermesHome });
+  }
   const sourceDirs = Array.from(new Set([
     hermesAgentSourcePath,
     path.join(hermesHome, 'hermes-agent'),
@@ -2498,7 +2505,7 @@ async function startHermesAgentApi(logs = []) {
   const apiHermesHome = await ensureWorkbenchApiHermesHome({ port: apiPort });
   const apiKey = await ensureWorkbenchApiKey();
   await cleanupStaleGatewayRuntimeFiles(apiHermesHome, logs);
-  const args = ['-m', 'hermes_cli.main', 'gateway', 'run', '--replace'];
+  const args = ['-m', 'hermes_cli.main', 'gateway', 'run', '--replace', '--force'];
   const logFile = runtimeApiLogPath();
   pushRuntimeLog(logs, `using Frakio ${runtime.source} runtime: ${runtime.runtimeDir}`);
   pushRuntimeLog(logs, `starting: ${runtime.python} ${args.join(' ')} on http://127.0.0.1:${apiPort}/v1`);
@@ -2861,6 +2868,8 @@ async function startProfileGateway(profileName) {
     stdio: 'ignore',
     detached: process.platform !== 'win32',
   });
+  profileGatewayProcesses.add(child);
+  child.once('exit', () => profileGatewayProcesses.delete(child));
   let spawnError = '';
   child.on('error', (error) => {
     spawnError = error.message || String(error);
@@ -3305,7 +3314,9 @@ async function ensureSymlink(target, linkPath) {
 
 function readRuntimePidFile(filePath) {
   try {
-    const data = JSON.parse(readFileSync(filePath, 'utf8'));
+    const raw = readFileSync(filePath, 'utf8').trim();
+    if (/^\d+$/.test(raw)) return Number.parseInt(raw, 10);
+    const data = JSON.parse(raw);
     const pid = typeof data?.pid === 'number' ? data.pid : Number.parseInt(String(data?.pid || ''), 10);
     return Number.isFinite(pid) && pid > 0 ? pid : null;
   } catch {
@@ -3328,6 +3339,10 @@ async function cleanupStaleGatewayRuntimeFiles(profileDir, logs = []) {
     const filePath = path.join(profileDir, fileName);
     if (!(await exists(filePath))) continue;
     const pid = readRuntimePidFile(filePath);
+    if (!pid) {
+      pushRuntimeLog(logs, `preserved unverified runtime file: ${filePath}`);
+      continue;
+    }
     if (pid && isProcessAlive(pid)) continue;
     await rm(filePath, { force: true }).catch(() => null);
     pushRuntimeLog(logs, `removed stale runtime file: ${filePath}`);
@@ -5404,12 +5419,11 @@ async function gitCommand(repoPath, args, options = {}, logs = []) {
 }
 
 async function readFrakioPackageVersion() {
-  try {
-    const raw = await readFile(path.join(projectRoot, 'package.json'), 'utf8');
-    return JSON.parse(raw)?.version || '';
-  } catch {
-    return '';
-  }
+  return resolveAppVersion({
+    envVersion: process.env.FRAKIO_WORK_APP_VERSION,
+    packagePath: path.join(projectRoot, 'package.json'),
+    readFileImpl: readFile,
+  });
 }
 
 async function readHermesAgentPackageInfo(repoPath = hermesAgentSourcePath) {
@@ -5615,7 +5629,7 @@ async function verifyManagedRuntime(runtimeDir, expectedVersion, logs) {
   if (expectedVersion && !versionOutput.includes(expectedVersion)) {
     throw new Error(`Runtime 版本验证失败：期望 ${expectedVersion}，实际为 ${versionOutput || '未知'}。`);
   }
-  await requireLoggedCommand(runtime.python, ['-c', 'import hermes_cli, hermes_cli.main; print("Hermes imports ready")'], {
+  await requireLoggedCommand(runtime.python, ['-c', `import aiohttp, hermes_cli, hermes_cli.main; assert aiohttp.__version__ == "${requiredAiohttpVersion}"; print("Hermes and aiohttp imports ready")`], {
     cwd: runtimeDir,
     timeout: 30000,
     env: { HERMES_HOME: hermesHome, HERMES_AGENT_ROOT: runtime.pythonRoot },
@@ -5671,7 +5685,7 @@ async function installManagedHermesRuntime({ tag = '' } = {}, logs = []) {
     await cp(bundled.runtimeDir, staging, { recursive: true, dereference: true, preserveTimestamps: true });
     await repairPortablePythonLinks(staging);
     const stagingRuntime = inspectHermesRuntimeDir(staging, 'managed');
-    await requireLoggedCommand(stagingRuntime.python, ['-m', 'pip', 'install', '--upgrade', '--force-reinstall', '--no-cache-dir', hermesAgentSourcePath], {
+    await requireLoggedCommand(stagingRuntime.python, ['-m', 'pip', 'install', '--upgrade', '--force-reinstall', '--no-cache-dir', hermesAgentSourcePath, `aiohttp==${requiredAiohttpVersion}`], {
       cwd: hermesAgentSourcePath,
       timeout: 30 * 60 * 1000,
       env: { HERMES_HOME: hermesHome, HERMES_AGENT_ROOT: stagingRuntime.pythonRoot },
@@ -5687,6 +5701,7 @@ async function installManagedHermesRuntime({ tag = '' } = {}, logs = []) {
       sourceRepo: officialHermesAgentRepo,
       sourceTag: targetTag,
       sourceCommit: commit,
+      pythonDependencies: { aiohttp: requiredAiohttpVersion },
       builtAt: now(),
       bridgeProtocolVersion: frakioBridgeProtocolVersion,
     };
@@ -6169,29 +6184,15 @@ async function runOfficialHermesSetup(logs = []) {
   }, logs);
 }
 
-function randomToken() {
-  return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-}
-
 async function ensureHermesBaseConfig(logs) {
   await mkdir(hermesHome, { recursive: true });
-  const envPath = path.join(hermesHome, '.env');
-  const envRaw = await readEnvValues(envPath);
-  const nextEnv = {
-    API_SERVER_ENABLED: envRaw.API_SERVER_ENABLED || 'true',
-    API_SERVER_HOST: envRaw.API_SERVER_HOST || '127.0.0.1',
-    API_SERVER_PORT: envRaw.API_SERVER_PORT || '8642',
-    API_SERVER_KEY: envRaw.API_SERVER_KEY || randomToken(),
-  };
-  const envLines = Object.entries({ ...envRaw, ...nextEnv }).map(([key, value]) => `${key}=${value}`);
-  await writeFile(envPath, `${envLines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
-  logs.push(`wrote ${envPath}`);
-
   const configPath = path.join(hermesHome, 'config.yaml');
-  const config = await readYamlFile(configPath);
-  config.approvals = { ...(config.approvals || {}), mode: approvalModeFromConfig(config) };
-  await writeFile(configPath, YAML.stringify(config), 'utf8');
-  logs.push(`wrote ${configPath}`);
+  if (!(await exists(configPath))) {
+    await writeFile(configPath, '{}\n', { encoding: 'utf8', mode: 0o600 });
+    logs.push(`created empty Hermes config: ${configPath}`);
+  } else {
+    logs.push(`preserved existing Hermes config and credentials: ${hermesHome}`);
+  }
 }
 
 app.get('/api/hermes-bootstrap/status', async (_req, res) => {
@@ -6224,8 +6225,7 @@ app.post('/api/hermes-bootstrap/install', async (req, res) => {
     logs.push(`using ${runtime.source} runtime ${runtime.version}: ${runtime.runtimeDir}`);
     phase = 'write-config';
     await ensureHermesBaseConfig(logs);
-    const moduleSync = await syncBundledSkillsDisabled();
-    logs.push(`synced bundled skills: copied=${moduleSync.copied.length}, total=${moduleSync.totalBundled}`);
+    const moduleSync = { skipped: true, reason: 'Frakio Work does not mutate user Hermes skills or config during startup.' };
 
     phase = 'start-runtime';
     await startHermesAgentApi(logs);
@@ -6254,7 +6254,7 @@ app.post('/api/hermes-bootstrap/start', async (_req, res) => {
 app.post('/api/hermes-bootstrap/import', async (_req, res) => {
   try {
     const state = await readState();
-    const moduleSync = await syncBundledSkillsDisabled();
+    const moduleSync = { skipped: true, reason: 'Profile import is read-only for user Hermes configuration.' };
     const result = await syncHermesProfilesToState(state);
     await writeState(result.state);
     res.json({
@@ -9569,13 +9569,43 @@ export async function startServer() {
 }
 
 let telemetryShutdownStarted = false;
+async function stopOwnedChild(child, label) {
+  if (!child || child.exitCode !== null) return;
+  console.log(`Stopping ${label} pid=${child.pid || 'unknown'}`);
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGTERM');
+  await Promise.race([
+    exited,
+    new Promise((resolve) => setTimeout(resolve, 1400)),
+  ]);
+  if (child.exitCode === null) {
+    child.kill('SIGKILL');
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 600))]);
+  }
+}
+
+async function stopOwnedRuntimeProcesses() {
+  const bridge = await probeHermesBridge({ timeoutMs: 500 }).catch(() => null);
+  const ownedBridgePids = bridge?.ownedByThisApi ? collectBridgePids(bridge.ping || {}) : [];
+  await Promise.all([
+    stopOwnedChild(hermesApiProcess, 'Runtime API'),
+    stopOwnedChild(hermesBridgeProcess, 'Hermes Bridge'),
+    ...[...profileGatewayProcesses].map((child) => stopOwnedChild(child, 'Profile Gateway')),
+  ]);
+  if (ownedBridgePids.length) await terminatePids(ownedBridgePids, [], 'owned Hermes Bridge');
+  hermesApiProcess = null;
+  hermesBridgeProcess = null;
+  profileGatewayProcesses.clear();
+}
+
 async function shutdownApi() {
   if (telemetryShutdownStarted) return;
   telemetryShutdownStarted = true;
+  await stopOwnedRuntimeProcesses().catch((error) => console.warn('Runtime shutdown warning:', error?.message || error));
   await Promise.race([telemetry.shutdown(), new Promise((resolve) => setTimeout(resolve, 900))]);
   if (httpServer) httpServer.close(() => process.exit(0));
   else process.exit(0);
-  setTimeout(() => process.exit(0), 150).unref();
+  setTimeout(() => process.exit(0), 3000).unref();
 }
 
 const isMainModule = path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url);

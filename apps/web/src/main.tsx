@@ -68,6 +68,15 @@ import {
 } from 'lucide-react';
 import frakioBrandLogoUrl from './assets/frakio-brand-logo.png';
 import { installLocalApiFetchGuard } from './api/fetch-guard';
+import { LaunchLoadingScreen } from './features/launch/LaunchLoadingScreen';
+import '@fontsource/doto/latin-400.css';
+import '@fontsource/doto/latin-600.css';
+import '@fontsource/doto/latin-700.css';
+import '@fontsource/space-grotesk/latin-400.css';
+import '@fontsource/space-grotesk/latin-500.css';
+import '@fontsource/space-grotesk/latin-700.css';
+import '@fontsource/space-mono/latin-400.css';
+import '@fontsource/space-mono/latin-700.css';
 import './styles.css';
 
 installLocalApiFetchGuard();
@@ -665,6 +674,7 @@ function App() {
   const [railContextMenu, setRailContextMenu] = useState<RailContextMenuTarget | null>(null);
   const [archivedThreads, setArchivedThreads] = useState<ThreadSummary[]>([]);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const userMenuRef = useRef<HTMLDivElement | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('hermes');
   const [libraryCollapsed, setLibraryCollapsed] = useState(false);
@@ -3207,7 +3217,7 @@ function App() {
           <>
           <div className="rail-actions">
             <button className={activeView === 'new-chat' ? 'rail-action active' : 'rail-action'} onClick={openNewChatLauncher} title="新对话"><Plus size={16} /><span>新对话</span></button>
-            <button className="rail-action" title="搜索"><Search size={16} /><span>搜索</span></button>
+            <button className="rail-action" title="搜索" onClick={() => setGlobalSearchOpen(true)}><Search size={16} /><span>搜索</span></button>
             {visiblePinnedNav.map((item) => {
               const Icon = item.icon;
               return (
@@ -3979,6 +3989,26 @@ function App() {
           }}
         />
       )}
+      {globalSearchOpen && (
+        <GlobalSearchDialog
+          conversations={conversations}
+          agents={agents}
+          onClose={() => setGlobalSearchOpen(false)}
+          onOpenThread={async (threadId) => {
+            setGlobalSearchOpen(false);
+            await openThread(threadId);
+          }}
+          onOpenAgent={(agentId) => {
+            setGlobalSearchOpen(false);
+            setSelectedOrgAgentId(agentId);
+            setActiveNav('org');
+          }}
+          onOpenSettings={() => {
+            setGlobalSearchOpen(false);
+            openSettingsSection('workbench');
+          }}
+        />
+      )}
     </div>
     )}
     {showFirstUseGuide && (
@@ -3998,7 +4028,7 @@ function App() {
     {launchPhase !== 'done' && (
       <LaunchLoadingScreen
         phase={launchPhase}
-        agent={defaultLaunchAgent}
+        agentName={defaultLaunchAgent?.name || ''}
         userAvatarUrl={launchWelcomeAvatarUrl}
         autoStart={hermesRuntime?.autoStart || null}
       />
@@ -4015,6 +4045,39 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || data?.error?.message || '请求失败');
   return data as T;
+}
+
+function GlobalSearchDialog({ conversations, agents, onClose, onOpenThread, onOpenAgent, onOpenSettings }: {
+  conversations: ThreadSummary[];
+  agents: Agent[];
+  onClose: () => void;
+  onOpenThread: (threadId: string) => Promise<void>;
+  onOpenAgent: (agentId: string) => void;
+  onOpenSettings: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const normalized = query.trim().toLowerCase();
+  const threads = conversations.filter((thread) => !normalized || `${thread.title} ${thread.preview} ${thread.primaryAgentName || ''}`.toLowerCase().includes(normalized)).slice(0, 8);
+  const matchingAgents = agents.filter((agent) => !normalized || `${agent.name} ${agent.role} ${agent.profileName || ''}`.toLowerCase().includes(normalized)).slice(0, 6);
+  useEffect(() => {
+    function handleKeydown(event: KeyboardEvent) {
+      if (event.key === 'Escape') onClose();
+    }
+    window.addEventListener('keydown', handleKeydown);
+    return () => window.removeEventListener('keydown', handleKeydown);
+  }, [onClose]);
+  return (
+    <div className="modal-backdrop global-search-backdrop" onClick={onClose}>
+      <div className="global-search-dialog" role="dialog" aria-modal="true" aria-label="全局搜索" onClick={(event) => event.stopPropagation()}>
+        <label className="global-search-input"><Search size={18} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索对话、Agent 或设置" /><button onClick={onClose} aria-label="关闭"><X size={16} /></button></label>
+        <div className="global-search-results">
+          <section><strong>对话</strong>{threads.length ? threads.map((thread) => <button key={thread.id} onClick={() => void onOpenThread(thread.id)}><MessageSquare size={16} /><span><b>{thread.title}</b><small>{thread.preview || '暂无内容'}</small></span></button>) : <p>没有匹配的对话</p>}</section>
+          <section><strong>Agent</strong>{matchingAgents.length ? matchingAgents.map((agent) => <button key={agent.id} onClick={() => onOpenAgent(agent.id)}><Bot size={16} /><span><b>{agent.name}</b><small>{agent.role}</small></span></button>) : <p>没有匹配的 Agent</p>}</section>
+          <section><strong>设置</strong><button onClick={onOpenSettings}><Settings size={16} /><span><b>打开设置</b><small>Runtime、模型、更新和工作台偏好</small></span></button></section>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 const profileOptionFallback = [{ name: 'default', model: '', provider: '', hasConfig: true, hasEnv: false, hasAuth: false }];
@@ -6582,7 +6645,12 @@ function HermesRuntimePanel({ runtime, bootstrap, localStatus, diagnostics, apiA
             {autoStart.steps.map((step) => <span className={step.status} key={step.id}>{step.label}</span>)}
           </div>
         ) : null}
-        {autoStart?.error && <em>{autoStart.error}</em>}
+        {autoStart?.error && (
+          <details className="runtime-autostart-log">
+            <summary>查看启动日志</summary>
+            <pre>{autoStart.error}</pre>
+          </details>
+        )}
       </div>
       <div className="runtime-status-grid">
         <div className={bundledRuntimeReady ? 'runtime-status-card connected' : 'runtime-status-card'}>
@@ -8534,46 +8602,6 @@ function FirstUseGuideOverlay({ guide, onClose, onRetry, onInstall }: { guide: F
   );
 }
 
-function LaunchLoadingScreen({ phase, agent, userAvatarUrl, autoStart }: { phase: LaunchPhase; agent: Agent | null; userAvatarUrl: string; autoStart: HermesRuntimeStatus['autoStart'] | null }) {
-  const steps = launchSteps(autoStart);
-  return (
-    <div className={`launch-screen ${phase === 'welcome' ? 'welcome' : 'working'}`} role="status" aria-live="polite">
-      <div className={`launch-shell ${userAvatarUrl ? 'has-user-avatar' : 'no-user-avatar'}`}>
-        <LaunchAvatar pulse={false} />
-        <div className="launch-content-stage">
-          <div className="launch-panel launch-working-panel">
-            <div className="launch-head">
-              <strong>正在连接本地 Hermes Agent</strong>
-              <span>{agent ? `${agent.name} 正在准备工作环境` : '正在准备工作环境'}</span>
-            </div>
-            <div className="launch-task-list">
-              {steps.map((step) => {
-                const done = step.status === 'ready' || step.status === 'skipped';
-                const active = step.status === 'running';
-                const failed = step.status === 'failed';
-                const Icon = done ? CheckCircle2 : active ? Clock3 : Circle;
-                return (
-                  <div className={`task-row ${done ? 'done' : ''} ${active ? 'active' : ''} ${failed ? 'failed' : ''}`} key={step.id}>
-                    <Icon size={15} />
-                    <span><strong>{step.label}</strong>{step.detail && <small>{step.detail}</small>}</span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-          <div className="launch-panel launch-welcome-panel">
-            <div className="launch-welcome">
-              <span>Hi，</span>
-              {userAvatarUrl && <span className="launch-user-avatar"><img src={userAvatarUrl} alt="" /></span>}
-              <span>欢迎回来</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function LaunchAvatar({ pulse }: { pulse: boolean }) {
   return (
     <span className={`launch-image-avatar brand-logo ${pulse ? 'pulse' : ''}`}>
@@ -8638,7 +8666,7 @@ function installStepSuccessDetail(stepId: string, data: any) {
   if (stepId === 'download') return data?.bootstrap?.sourcePath || '官方仓库已准备';
   if (stepId === 'setup-runtime') return '官方 setup-hermes.sh 已完成';
   if (stepId === 'verify-cli') return data?.tools?.hermes || 'hermes CLI 可执行';
-  if (stepId === 'write-config') return '~/.hermes/config.yaml 和 .env 已准备';
+  if (stepId === 'write-config') return '已保留现有 Hermes 配置，Runtime 使用 Frakio Work 独立配置';
   return data?.bootstrap?.status === 'connected' ? '本地 Hermes 已连接' : '已完成安装后检测';
 }
 
@@ -8685,16 +8713,6 @@ function writeLaunchUserAvatarSnapshot(avatarUrl: string | null) {
   } catch {
     // localStorage can be disabled; the launch screen still renders from live profile data.
   }
-}
-
-function launchSteps(autoStart: HermesRuntimeStatus['autoStart'] | null) {
-  const fallback: NonNullable<HermesRuntimeStatus['autoStart']>['steps'] = [
-    { id: 'profiles', label: '读取本地 Hermes Profiles', status: 'running' as const },
-    { id: 'bridge', label: '启动 Frakio Work Bridge', status: 'running' as const },
-    { id: 'api', label: '启动 Frakio Work Runtime API', status: 'running' as const },
-    { id: 'gateways', label: '启动 Profile Gateway', status: 'running' as const },
-  ];
-  return autoStart?.steps?.length ? autoStart.steps : fallback;
 }
 
 function MessageAvatar({ message, agents, userProfile }: { message: ChatEvent; agents: Agent[]; userProfile?: UserProfile }) {
