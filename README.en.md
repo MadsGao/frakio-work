@@ -50,12 +50,12 @@ At the current stage, my own evaluation of Frakio Work in actual use is that it 
 3. The lower-right corner of the input box adds model switching, so you can switch the model for the current Agent at any time. This does not affect the Agent's global default model and only takes effect in the current session.
 #### Conversation Interface - Summon With @ At Any Time
 
-![CleanShot 2026-07-19 at 13.19.33@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/YtsR/2534X1198/custom_name.jpg)
+![CleanShot 2026-07-19 at 13.19.33@2x.png](docs/assets/readme/chat-mention.png)
 
 During a conversation, you can freely type @ to summon other Agents into the conversation.
 #### Conversation Follow Mode Switching
 
-![CleanShot 2026-07-19 at 13.24.10@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/gFEn/2516X888/custom_name.jpg)
+![CleanShot 2026-07-19 at 13.24.10@2x.png](docs/assets/readme/conversation-follow.png)
 
 At the top of the conversation, you can set the multi-agent mode for the current conversation:
 1. Default follow: when you do not @ another Agent, the next reply will be handled by the global default Agent. The global default Agent can be set in the Agent configuration center.
@@ -64,7 +64,7 @@ At the top of the conversation, you can set the multi-agent mode for the current
 4. Knowledge vault (in development): link a local Obsidian vault and call the rule index from the corresponding Obsidian vault to enable deep multi-agent collaboration.
 #### Quick Conversation Index
 
-![CleanShot 2026-07-19 at 13.53.04@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/CWH5/2026X630/custom_name.jpg)
+![CleanShot 2026-07-19 at 13.53.04@2x.png](docs/assets/readme/quick-index.png)
 
 A quick jump index has been added during conversations. It recreates Codex's quick conversation index and is useful when there are too many messages and you need to jump quickly.
 ## Left And Right Sidebars
@@ -75,7 +75,7 @@ This recreates Codex's smooth dynamic left and right sidebar interactions, and t
 ## Settings Improvements
 ### Fast Agent Configuration Center
 
-![CleanShot 2026-07-19 at 12.54.15@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/ppyc/2492X1674/custom_name.jpg)
+![CleanShot 2026-07-19 at 12.54.15@2x.png](docs/assets/readme/agent-config-center.png)
 
 1. Scattered Agent settings are collected into one place and displayed as cards for easier management.
 2. Agent avatars can be customized.
@@ -83,27 +83,27 @@ This recreates Codex's smooth dynamic left and right sidebar interactions, and t
 4. Agent default models are added, meaning the default model used when the user does not specify a model for that Agent.
 ### Model Configuration
 
-![CleanShot 2026-07-19 at 13.28.46@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/XnGq/2528X1376/custom_name.jpg)
+![CleanShot 2026-07-19 at 13.28.46@2x.png](docs/assets/readme/model-config.png)
 
 Configure a model once, and multiple Agents can share it. I developed this module because in Hermes Agent and other third-party usage flows, each Agent has to be configured separately, which feels repetitive.
 ### Monitoring Beautification
 
-![CleanShot 2026-07-19 at 13.31.05@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/LlQl/2520X1670/custom_name.jpg)
+![CleanShot 2026-07-19 at 13.31.05@2x.png](docs/assets/readme/monitor-dashboard.png)
 
 Because the original one was too ugly, I made a visual beautification, referencing the CC Switch Token monitoring panel.
 ### Personal Profile
 
-![CleanShot 2026-07-19 at 13.32.57@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/Laoq/2522X1692/custom_name.jpg)
+![CleanShot 2026-07-19 at 13.32.57@2x.png](docs/assets/readme/profile.png)
 
 A personal profile page has been added, referencing Codex's personal profile page. There should always be a stats panel to show off your AI usage process. You can customize your own conversation avatar, and that avatar will appear on the loading welcome page and in conversations.
 ### Obsidian Vault (In Development)
 
-![CleanShot 2026-07-19 at 13.34.13@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/0bw7/2516X1620/custom_name.jpg)
+![CleanShot 2026-07-19 at 13.34.13@2x.png](docs/assets/readme/obsidian-vault.png)
 
 This is a key point for deep multi-agent collaboration. Only when each Agent's working interaction files actually interact locally can precise collaboration be achieved, instead of relying on context or cross-session context guessing. The development direction is to switch between different vaults and reference the rule indexes in those vaults, so different large-scale operations projects can be operated precisely.
 ### Multi-Workspace Concept
 
-![CleanShot 2026-07-19 at 13.37.55@2x.png](https://tc-new.z.wiki/autoupload/7Ctvce4jvjnG9FK-Y_TpmSfNcKcqEnRmcljopnyJoMs/20260719/OflC/2538X1704/custom_name.jpg)
+![CleanShot 2026-07-19 at 13.37.55@2x.png](docs/assets/readme/workspaces.png)
 
 This idea comes from Arc's workspace classification concept. In actual use, for example, there can be one workspace for project development, one for media operations, one for casual conversations, and one for independent site operations.
 
