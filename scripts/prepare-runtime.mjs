@@ -7,7 +7,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
 const runtimeRoot = path.join(projectRoot, 'runtime', 'hermes');
 const bridgeDest = path.join(projectRoot, 'runtime', 'agent-bridge', 'python');
-const bridgeProtocolVersion = 1;
+const bridgeProtocolVersion = 2;
 
 function platformDir() {
   if (process.platform === 'darwin' && process.arch === 'arm64') return 'mac-arm64';

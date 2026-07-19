@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import json
 import os
 import queue
@@ -1023,6 +1024,102 @@ class AgentPool:
         except Exception:
             pass
 
+    @staticmethod
+    def _attachment_manifest(attachments: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for attachment in attachments:
+            if str(attachment.get("kind") or "") == "image":
+                continue
+            name = str(attachment.get("name") or "attachment")
+            kind = str(attachment.get("kind") or "file")
+            mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+            file_path = str(attachment.get("path") or "")
+            lines.append(
+                f"[Attached {kind}: {name} ({mime_type}) at {file_path}. "
+                "Inspect this local file with the appropriate read_file, document, transcription, video, archive, or terminal tool.]"
+            )
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _vision_descriptions(image_paths: list[str], profile: str | None = None) -> str:
+        from tools.vision_tools import vision_analyze_tool
+
+        descriptions: list[str] = []
+        cfg = _load_cfg(profile)
+        vision_cfg = ((cfg.get("auxiliary") or {}).get("vision") or {}) if isinstance(cfg, dict) else {}
+        try:
+            timeout_seconds = max(15.0, min(float(vision_cfg.get("timeout") or 120), 180.0)) + 5.0
+        except (TypeError, ValueError):
+            timeout_seconds = 125.0
+        prompt = (
+            "Describe everything visible in this image in thorough detail. "
+            "Include all readable text, code, data, objects, people, layout, and colors."
+        )
+        for image_path in image_paths:
+            try:
+                raw = asyncio.run(asyncio.wait_for(
+                    vision_analyze_tool(image_url=image_path, user_prompt=prompt),
+                    timeout=timeout_seconds,
+                ))
+                result = json.loads(raw) if isinstance(raw, str) else raw
+            except TimeoutError as exc:
+                raise RuntimeError(f"附件图片分析超时：{image_path} ({timeout_seconds:.0f}s)") from exc
+            except Exception as exc:
+                raise RuntimeError(f"附件图片分析失败：{image_path} ({exc})") from exc
+            if not isinstance(result, dict) or not result.get("success") or not str(result.get("analysis") or "").strip():
+                detail = result.get("error") if isinstance(result, dict) else "empty vision result"
+                raise RuntimeError(f"附件图片分析失败：{image_path} ({detail or 'unknown error'})")
+            descriptions.append(
+                f"[The user attached an image at {image_path}. Vision analysis:\n{result['analysis']}\n"
+                f"Use vision_analyze with image_url={image_path!r} if a closer look is needed.]"
+            )
+        return "\n\n".join(descriptions)
+
+    def _prepare_attachment_message(
+        self,
+        session: AgentSession,
+        message: Any,
+        attachments: list[dict[str, Any]] | None,
+        profile: str | None,
+    ) -> Any:
+        items = [item for item in (attachments or []) if isinstance(item, dict)]
+        if not items:
+            return message
+        for item in items:
+            file_path = str(item.get("path") or "")
+            if not file_path or not os.path.isfile(file_path):
+                raise RuntimeError(f"附件文件不存在或不可读：{item.get('name') or file_path or 'unknown'}")
+
+        text = str(message or "").strip() or "请查看并处理这些附件。"
+        manifest = self._attachment_manifest(items)
+        if manifest:
+            text = f"{text}\n\n{manifest}"
+        image_paths = [str(item.get("path")) for item in items if str(item.get("kind") or "") == "image"]
+        if not image_paths:
+            return text
+
+        try:
+            from agent.image_routing import build_native_content_parts, decide_image_input_mode
+
+            mode = decide_image_input_mode(
+                str(session.config.get("provider") or ""),
+                str(session.config.get("model") or ""),
+                _load_cfg(profile),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"附件图片路由初始化失败：{exc}") from exc
+
+        if mode == "native":
+            parts, skipped = build_native_content_parts(text, image_paths)
+            if skipped:
+                raise RuntimeError(f"附件图片无法读取或转换：{', '.join(skipped)}")
+            if not any(isinstance(part, dict) and part.get("type") == "image_url" for part in parts):
+                raise RuntimeError("附件图片没有进入 Hermes 多模态请求。")
+            return parts
+
+        descriptions = self._vision_descriptions(image_paths, profile)
+        return f"{descriptions}\n\n{text}" if descriptions else text
+
     def _session_db_message_count(self, session_id: str, profile: str | None) -> int | None:
         db = self._db.get_for_profile(profile)
         if db is None or not hasattr(db, "get_messages"):
@@ -1108,6 +1205,7 @@ class AgentPool:
         session_id: str,
         message: Any,
         storage_message: Any | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         instructions: str | None = None,
         conversation_history: list[dict[str, Any]] | None = None,
         profile: str | None = None,
@@ -1140,14 +1238,14 @@ class AgentPool:
 
         thread = threading.Thread(
             target=self._run_chat,
-            args=(session, record, message, storage_message, instructions, conversation_history, profile, force_compress, workspace, source, reasoning_effort),
+            args=(session, record, message, storage_message, attachments, instructions, conversation_history, profile, force_compress, workspace, source, reasoning_effort),
             daemon=True,
             name=f"hermes-bridge-run-{run_id[:8]}",
         )
         thread.start()
         return record
 
-    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None) -> None:
+    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, attachments: list[dict[str, Any]] | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None) -> None:
         with _profile_env(profile):
             _refresh_approval_allowlist()
             _install_execute_code_approval_memory_patch()
@@ -1196,7 +1294,8 @@ class AgentPool:
                     pass
                 self._prepersist_user_message(session, message, storage_message, conversation_history, profile, source)
                 db_count_after_prepersist = self._session_db_message_count(session.session_id, profile)
-                agent_message = self._prepend_pending_model_switch_note(session, message)
+                prepared_message = self._prepare_attachment_message(session, message, attachments, profile)
+                agent_message = self._prepend_pending_model_switch_note(session, prepared_message)
                 if force_compress:
                     compress = getattr(session.agent, "_compress_context", None)
                     if callable(compress):

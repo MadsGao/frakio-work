@@ -1,5 +1,6 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { AppUpdateStatus } from '@frakio/contracts';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { AppUpdateStatus, Attachment } from '@frakio/contracts';
+import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -137,7 +138,15 @@ type VaultSummary = {
   lastIndexedAt?: string;
   needsRefresh: boolean;
 };
-type ChatEvent = { id: string; agentId: string; agentName: string; role: string; content: string; reasoning?: string; externalRunId?: string };
+type ChatEvent = { id: string; agentId: string; agentName: string; role: string; content: string; attachments?: Attachment[]; reasoning?: string; externalRunId?: string };
+type AttachmentDraft = { localId: string; file: File; previewUrl: string; status: 'uploading' | 'ready' | 'error'; attachment?: Attachment; error?: string };
+const attachmentAcceptValue = [
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.heic', '.svg', '.ico',
+  '.txt', '.md', '.csv', '.tsv', '.json', '.jsonl', '.xml', '.yaml', '.yml', '.toml', '.sql', '.pdf', '.doc', '.docx', '.odt', '.rtf',
+  '.xls', '.xlsx', '.ppt', '.pptx', '.odp', '.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus',
+  '.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi', '.mpeg', '.mpg', '.zip', '.tar', '.gz', '.tgz', '.bz2', '.7z',
+  '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.css', '.html', '.py', '.rb', '.php', '.java', '.go', '.rs', '.swift', '.c', '.h', '.cpp', '.sh', '.zsh', '.vue', '.svelte', '.astro',
+].join(',');
 type MentionOption = { key: string; type: 'all' | 'agent'; name: string; label: string; description: string; agent?: Agent };
 type ChatRunTarget = { kind: 'agent'; agent: Agent } | { kind: 'all'; agent: Agent | null };
 type Proposal = { id: string; type: string; title: string; risk: 'low' | 'medium' | 'high'; target: string; status: string };
@@ -646,8 +655,11 @@ function App() {
   const [newChatPermissionMode, setNewChatPermissionMode] = useState<PermissionMode>('manual');
   const [selectedNewChatWorkspaceId, setSelectedNewChatWorkspaceId] = useState<string | null>(null);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
-  const [attachments, setAttachments] = useState<File[]>([]);
+  const [attachments, setAttachments] = useState<AttachmentDraft[]>([]);
+  const [attachmentDragActive, setAttachmentDragActive] = useState(false);
+  const [attachmentNotice, setAttachmentNotice] = useState('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const attachmentDragDepthRef = useRef(0);
   const threadScrollRef = useRef<HTMLDivElement | null>(null);
   const threadContentRef = useRef<HTMLDivElement | null>(null);
   const threadBottomRef = useRef<HTMLDivElement | null>(null);
@@ -1023,6 +1035,10 @@ function App() {
   };
   const autoSidebarCollapsed = isDesktopShell && !isSettingsNav && viewportWidth < (rightRailOpen ? autoCollapseSidebarWithRightRailWidth : autoCollapseSidebarWidth);
   const effectiveSidebarCollapsed = sidebarCollapsed || (autoSidebarCollapsed && !sidebarManuallyExpanded);
+
+  useEffect(() => {
+    if (!autoSidebarCollapsed) setSidebarManuallyExpanded(false);
+  }, [autoSidebarCollapsed]);
   const activeSpaceTheme = resolveEffectiveSpaceTheme(activeSpace?.theme);
   const activeSpaceRgb = hexToRgb(activeSpaceTheme.sidebarBg);
   const activeSpaceIsDark = activeSpaceTheme.appearance === 'dark' || (activeSpaceTheme.appearance === 'auto' && isThemeNightTime());
@@ -1916,7 +1932,6 @@ function App() {
     if ('sidebarCollapsed' in next) {
       const collapsed = Boolean(next.sidebarCollapsed);
       setSidebarCollapsed(collapsed);
-      setSidebarManuallyExpanded(!collapsed);
     }
     if (typeof next.sidebarWidth === 'number') setSidebarWidth(clampNumber(next.sidebarWidth, sidebarWidthBounds.min, sidebarWidthBounds.max));
     if (typeof next.contextWidth === 'number') setContextWidth(clampNumber(next.contextWidth, contextWidthBounds.min, contextWidthBounds.max));
@@ -1941,7 +1956,7 @@ function App() {
 
   function toggleDesktopSidebar() {
     const nextCollapsed = !effectiveSidebarCollapsed;
-    setSidebarManuallyExpanded(!nextCollapsed);
+    setSidebarManuallyExpanded(autoSidebarCollapsed && !nextCollapsed);
     void persistUi({ sidebarCollapsed: nextCollapsed });
   }
 
@@ -2387,12 +2402,17 @@ function App() {
     setActiveHermesRun(null);
   }
 
-  async function runHermesAgentThread(threadId: string, text: string, selectedAgentsForRun: string[], startedAt: number, target: ChatRunTarget | null) {
+  async function runHermesAgentThread(threadId: string, text: string, selectedAgentsForRun: string[], startedAt: number, target: ChatRunTarget | null, runAttachments: Attachment[] = [], onAccepted?: () => void) {
     resetRunUi();
-    const userDraftMessage: ChatEvent = { id: `local-user-${startedAt}`, agentId: 'user', agentName: '你', role: 'Workspace Owner', content: text };
+    const userDraftMessage: ChatEvent = { id: `local-user-${startedAt}`, agentId: 'user', agentName: '你', role: 'Workspace Owner', content: text, attachments: runAttachments };
     const appendMissingRunMessages = (thread: Thread, runId: string, assistantDraft = '') => {
       let nextMessages = [...thread.messages];
-      const hasUserMessage = nextMessages.some((message) => message.agentId === 'user' && message.content.trim() === text.trim());
+      const attachmentIds = runAttachments.map((attachment) => attachment.id).sort().join(',');
+      const hasUserMessage = nextMessages.some((message) => (
+        message.agentId === 'user'
+        && message.content.trim() === text.trim()
+        && (message.attachments || []).map((attachment) => attachment.id).sort().join(',') === attachmentIds
+      ));
       if (!hasUserMessage) nextMessages = [...nextMessages, userDraftMessage];
       const finalDraft = assistantDraft.trim();
       const hasAssistantResult = nextMessages.some((message) => (
@@ -2420,12 +2440,13 @@ function App() {
     const createRes = await fetch(`/api/threads/${threadId}/runs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, selectedAgents: selectedAgentsForRun, targetAgentId: target?.kind === 'agent' ? target.agent.id : '' }),
+      body: JSON.stringify({ message: text, attachmentIds: runAttachments.map((attachment) => attachment.id), selectedAgents: selectedAgentsForRun, targetAgentId: target?.kind === 'agent' ? target.agent.id : '' }),
     });
     const created = await createRes.json().catch(() => ({}));
     if (!createRes.ok) {
       throw new Error(formatHermesRuntimeError(created.error || 'Hermes Bridge run 创建失败。', target?.agent ? resolveHermesProfileNameForAgent(target.agent, localProfilesForComposer) : activeComposerProfileName, created.details));
     }
+    onAccepted?.();
     const run = { runId: created.runId, sessionId: created.sessionId, threadId };
     setActiveHermesRun(run);
     await new Promise<void>((resolve, reject) => {
@@ -2658,7 +2679,8 @@ function App() {
 
   async function startNewChat() {
     const text = newChatInput.trim();
-    if (!text || isRunning) return;
+    const runAttachments = attachments.flatMap((item) => item.status === 'ready' && item.attachment ? [item.attachment] : []);
+    if (isRunning || attachments.some((item) => item.status !== 'ready') || (!text && !runAttachments.length)) return;
     const startedAt = Date.now();
     setThreadFollowState(true);
     setIsRunning(true);
@@ -2670,31 +2692,34 @@ function App() {
       const draftModelOverrides = newChatModelOverride && newChatAgent
         ? { [newChatAgent.id]: newChatModelOverride }
         : {};
+      const titleSeed = text || runAttachments[0]?.name || '新的对话';
       const created = selectedNewChatWorkspaceId
         ? await fetch(`/api/workspaces/${selectedNewChatWorkspaceId}/threads`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: text.slice(0, 40) || '新的项目对话', agentModelOverrides: draftModelOverrides }),
+          body: JSON.stringify({ title: titleSeed.slice(0, 40), agentModelOverrides: draftModelOverrides }),
         }).then((res) => res.json())
         : await fetch('/api/conversations', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ primaryAgentId: newChatAgent?.id || 'iris', title: text.slice(0, 40) || `${newChatAgent?.name || 'Iris'} 对话`, agentModelOverrides: draftModelOverrides, spaceId: activeSpaceId }),
+          body: JSON.stringify({ primaryAgentId: newChatAgent?.id || 'iris', title: titleSeed.slice(0, 40), agentModelOverrides: draftModelOverrides, spaceId: activeSpaceId }),
         }).then((res) => res.json());
       const thread = created.thread as Thread;
       await patchThreadPermission(thread.id, newChatPermissionMode, newChatProfileName);
-      const localUserMessage = { id: `local-${Date.now()}`, agentId: 'user', agentName: '你', role: 'Workspace Owner', content: text };
+      const localUserMessage: ChatEvent = { id: `local-${Date.now()}`, agentId: 'user', agentName: '你', role: 'Workspace Owner', content: text, attachments: runAttachments };
       const optimisticThread = { ...thread, messages: [...thread.messages, localUserMessage] };
       setInput('');
-      setNewChatInput('');
       setNewChatModelOverride('');
-      setAttachments([]);
       setActiveView('thread');
       setActiveThread(optimisticThread);
       const runAgents = thread.selectedAgents || ['iris', ...(thread.mode === 'workspace' ? ['max'] : [])];
       try {
-        await runHermesAgentThread(thread.id, text, runAgents, startedAt, target);
+        await runHermesAgentThread(thread.id, text, runAgents, startedAt, target, runAttachments, () => {
+          setNewChatInput('');
+          clearAttachmentDrafts();
+        });
       } catch (error) {
+        setInput(text);
         setRunError(error instanceof Error ? error.message : '本机 Hermes Bridge 未连接。');
         await refreshHermesRuntime();
       }
@@ -2720,7 +2745,7 @@ function App() {
     setSelectedNewChatWorkspaceId(null);
     setProjectPickerOpen(false);
     setNewChatPermissionMode(uiSettings.defaultPermissionMode || 'manual');
-    setAttachments([]);
+    void discardAttachmentDrafts();
   }
 
   function openNavSection(sectionId: string) {
@@ -2949,7 +2974,8 @@ function App() {
 
   async function sendMessage() {
     const text = input.trim();
-    if (!text || isRunning || !activeThread) return;
+    const runAttachments = attachments.flatMap((item) => item.status === 'ready' && item.attachment ? [item.attachment] : []);
+    if (isRunning || !activeThread || attachments.some((item) => item.status !== 'ready') || (!text && !runAttachments.length)) return;
     const startedAt = Date.now();
     setThreadFollowState(true);
     setIsRunning(true);
@@ -2957,16 +2983,17 @@ function App() {
     const target = resolveRunTarget(text, agents, activeComposerAgent);
     setRunTarget(target);
     setCompletedRunSummary(null);
-    setInput('');
-    setAttachments([]);
     const optimisticThread = {
       ...activeThread,
-      messages: [...activeThread.messages, { id: `local-user-${startedAt}`, agentId: 'user', agentName: '你', role: 'Workspace Owner', content: text }],
+      messages: [...activeThread.messages, { id: `local-user-${startedAt}`, agentId: 'user', agentName: '你', role: 'Workspace Owner', content: text, attachments: runAttachments }],
     };
     setActiveThread(optimisticThread);
     try {
       try {
-        await runHermesAgentThread(activeThread.id, text, selectedAgentIds, startedAt, target);
+        await runHermesAgentThread(activeThread.id, text, selectedAgentIds, startedAt, target, runAttachments, () => {
+          setInput('');
+          clearAttachmentDrafts();
+        });
       } catch (error) {
         setRunError(error instanceof Error ? error.message : '本机 Hermes Bridge 未连接。');
         await refreshHermesRuntime();
@@ -2982,15 +3009,111 @@ function App() {
     }
   }
 
-  function handleAttachmentChange(files: FileList | null) {
-    const nextFiles = Array.from(files || []);
-    if (!nextFiles.length) return;
-    setAttachments((current) => [...current, ...nextFiles]);
+  function clearAttachmentDrafts() {
+    attachments.forEach((item) => { if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); });
+    setAttachments([]);
+    setAttachmentNotice('');
+  }
+
+  async function discardAttachmentDrafts() {
+    const current = [...attachments];
+    clearAttachmentDrafts();
+    await Promise.all(current.map((item) => item.attachment
+      ? fetch(`/api/attachments/${item.attachment.id}`, { method: 'DELETE' }).catch(() => null)
+      : null));
+  }
+
+  async function uploadAttachment(localId: string, file: File) {
+    setAttachments((current) => current.map((item) => item.localId === localId ? { ...item, status: 'uploading', error: '' } : item));
+    try {
+      const response = await fetch(`/api/attachments?name=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.attachment) throw new Error(data.error || '附件上传失败。');
+      setAttachments((current) => current.map((item) => item.localId === localId ? { ...item, status: 'ready', attachment: data.attachment, error: '' } : item));
+    } catch (error) {
+      setAttachments((current) => current.map((item) => item.localId === localId ? { ...item, status: 'error', error: error instanceof Error ? error.message : '附件上传失败。' } : item));
+    }
+  }
+
+  function handleAttachmentChange(files: FileList | File[] | null) {
+    const selected = Array.from(files || []);
+    if (!selected.length) return;
+    const existing = new Set(attachments.map((item) => `${item.file.name}:${item.file.size}:${item.file.lastModified}`));
+    const unique = selected.filter((file) => !existing.has(`${file.name}:${file.size}:${file.lastModified}`));
+    const available = Math.max(0, 10 - attachments.length);
+    const nextFiles = unique.slice(0, available);
+    if (selected.length > nextFiles.length) setAttachmentNotice(available === 0 ? '每条消息最多添加 10 个附件。' : '已忽略重复文件或超出 10 个的附件。');
+    else setAttachmentNotice('');
+    const existingBytes = attachments.reduce((sum, item) => sum + item.file.size, 0);
+    let acceptedBytes = existingBytes;
+    const drafts = nextFiles.map((file) => {
+      const tooLarge = file.size > 32 * 1024 * 1024;
+      const totalTooLarge = acceptedBytes + file.size > 100 * 1024 * 1024;
+      if (!tooLarge && !totalTooLarge) acceptedBytes += file.size;
+      return {
+      localId: crypto.randomUUID(),
+      file,
+      previewUrl: isBrowserPreviewableImage(file) ? URL.createObjectURL(file) : '',
+      status: tooLarge || totalTooLarge ? 'error' as const : 'uploading' as const,
+      error: tooLarge ? '单个附件不能超过 32 MiB。' : totalTooLarge ? '单条消息的附件总量不能超过 100 MiB。' : '',
+    }; });
+    setAttachments((current) => [...current, ...drafts]);
+    drafts.filter((draft) => draft.status === 'uploading').forEach((draft) => void uploadAttachment(draft.localId, draft.file));
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
-  function removeAttachment(index: number) {
-    setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  function removeAttachment(localId: string) {
+    const target = attachments.find((item) => item.localId === localId);
+    if (!target) return;
+    if (target.previewUrl) URL.revokeObjectURL(target.previewUrl);
+    setAttachments((current) => current.filter((item) => item.localId !== localId));
+    if (target.attachment) void fetch(`/api/attachments/${target.attachment.id}`, { method: 'DELETE' }).catch(() => null);
+  }
+
+  function retryAttachment(localId: string) {
+    const target = attachments.find((item) => item.localId === localId);
+    if (!target) return;
+    if (target.file.size > 32 * 1024 * 1024) {
+      setAttachmentNotice('单个附件不能超过 32 MiB。');
+      return;
+    }
+    const otherBytes = attachments.reduce((sum, item) => item.localId === localId ? sum : sum + item.file.size, 0);
+    if (otherBytes + target.file.size > 100 * 1024 * 1024) {
+      setAttachmentNotice('单条消息的附件总量不能超过 100 MiB。');
+      return;
+    }
+    void uploadAttachment(localId, target.file);
+  }
+
+  function handleAttachmentDragEnter(event: React.DragEvent) {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    attachmentDragDepthRef.current += 1;
+    setAttachmentDragActive(true);
+  }
+
+  function handleAttachmentDragOver(event: React.DragEvent) {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  }
+
+  function handleAttachmentDragLeave(event: React.DragEvent) {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    attachmentDragDepthRef.current = Math.max(0, attachmentDragDepthRef.current - 1);
+    if (attachmentDragDepthRef.current === 0) setAttachmentDragActive(false);
+  }
+
+  function handleAttachmentDrop(event: React.DragEvent) {
+    event.preventDefault();
+    attachmentDragDepthRef.current = 0;
+    setAttachmentDragActive(false);
+    handleAttachmentChange(event.dataTransfer.files);
   }
 
   async function toggleAgent(agentId: string) {
@@ -3521,7 +3644,15 @@ function App() {
                   )}
                 </div>
               )}
-              <div className="composer new-chat-composer">
+              <div
+                className={`composer new-chat-composer ${attachmentDragActive ? 'attachment-drag-active' : ''}`}
+                onDragEnter={handleAttachmentDragEnter}
+                onDragOver={handleAttachmentDragOver}
+                onDragLeave={handleAttachmentDragLeave}
+                onDrop={handleAttachmentDrop}
+              >
+                <AttachmentTray attachments={attachments} notice={attachmentNotice} onRemove={removeAttachment} onRetry={retryAttachment} />
+                {attachmentDragActive && <div className="attachment-drop-overlay"><ArrowDownToLine size={22} /><strong>松开即可添加附件</strong></div>}
                 <MentionTextarea
                   value={newChatInput}
                   onChange={setNewChatInput}
@@ -3534,7 +3665,7 @@ function App() {
                 <div className="composer-toolbar">
                   <div className="composer-left-tools">
                     <button className="icon-btn composer-tool upload" onClick={() => fileInputRef.current?.click()} aria-label="上传附件" title="上传附件"><Plus size={19} /></button>
-                    <input ref={fileInputRef} className="file-input" type="file" multiple onChange={(event) => handleAttachmentChange(event.target.files)} />
+                    <input ref={fileInputRef} className="file-input" type="file" multiple accept={attachmentAcceptValue} onChange={(event) => handleAttachmentChange(event.target.files)} />
                     <PermissionModeControl value={newChatPermissionMode} onChange={setNewChatPermissionMode} />
                   </div>
                   <div className="composer-right-tools">
@@ -3554,23 +3685,12 @@ function App() {
                       isRunning={isRunning}
                       hasActiveRun={Boolean(activeHermesRun)}
                       isStopping={runStopping}
-                      canSend={Boolean(newChatInput.trim())}
+                      canSend={attachments.every((item) => item.status === 'ready') && Boolean(newChatInput.trim() || attachments.length)}
                       onSend={() => void startNewChat()}
                       onStop={() => void stopActiveRun()}
                     />
                   </div>
                 </div>
-                {attachments.length > 0 && (
-                  <div className="attachment-chips" aria-label="已选择附件">
-                    {attachments.map((file, index) => (
-                      <span className="attachment-chip" key={`${file.name}-${file.size}-${index}`}>
-                        <span>{file.name}</span>
-                        <small>{formatFileSize(file.size)}</small>
-                        <button onClick={() => removeAttachment(index)} aria-label={`移除 ${file.name}`}><X size={12} /></button>
-                      </span>
-                    ))}
-                  </div>
-                )}
               </div>
               <div className="new-chat-project">
                 <button className="new-chat-project-row" onClick={() => setProjectPickerOpen((open) => !open)} aria-expanded={projectPickerOpen}>
@@ -3719,8 +3839,9 @@ function App() {
                       {message.agentId !== 'user' && <MessageAvatar message={message} agents={agents} />}
                       <div className="message-body">
                         {message.agentId !== 'user' && <div className="message-meta"><strong>{message.agentName}</strong></div>}
+                        {message.attachments && message.attachments.length > 0 && <MessageAttachments attachments={message.attachments} />}
                         {message.agentId === 'user' ? (
-                          <p className="message-text">{message.content}</p>
+                          message.content ? <p className="message-text">{message.content}</p> : null
                         ) : (
                           <MarkdownMessage content={animatedMessageContent[message.id] ?? message.content} streaming={Boolean(streamingMessageIds[message.id])} />
                         )}
@@ -3767,7 +3888,15 @@ function App() {
                     onApprove={(choice) => void approveActiveRun(choice)}
                   />
                 ) : (
-                  <div className="composer">
+                  <div
+                    className={`composer ${attachmentDragActive ? 'attachment-drag-active' : ''}`}
+                    onDragEnter={handleAttachmentDragEnter}
+                    onDragOver={handleAttachmentDragOver}
+                    onDragLeave={handleAttachmentDragLeave}
+                    onDrop={handleAttachmentDrop}
+                  >
+                  <AttachmentTray attachments={attachments} notice={attachmentNotice} onRemove={removeAttachment} onRetry={retryAttachment} />
+                  {attachmentDragActive && <div className="attachment-drop-overlay"><ArrowDownToLine size={22} /><strong>松开即可添加附件</strong></div>}
                   <MentionTextarea
                     value={input}
                     onChange={setInput}
@@ -3780,7 +3909,7 @@ function App() {
 	                  <div className="composer-toolbar">
 	                    <div className="composer-left-tools">
 	                      <button className="icon-btn composer-tool upload" onClick={() => fileInputRef.current?.click()} aria-label="上传附件" title="上传附件"><Plus size={19} /></button>
-	                      <input ref={fileInputRef} className="file-input" type="file" multiple onChange={(event) => handleAttachmentChange(event.target.files)} />
+	                      <input ref={fileInputRef} className="file-input" type="file" multiple accept={attachmentAcceptValue} onChange={(event) => handleAttachmentChange(event.target.files)} />
 	                      <PermissionModeControl value={permissionMode} onChange={(mode) => void updateThreadPermissionMode(mode)} />
 	                    </div>
 	                    <div className="composer-right-tools">
@@ -3800,23 +3929,12 @@ function App() {
 	                        isRunning={isRunning}
 	                        hasActiveRun={Boolean(activeHermesRun)}
 	                        isStopping={runStopping}
-	                        canSend={Boolean(input.trim())}
+	                        canSend={attachments.every((item) => item.status === 'ready') && Boolean(input.trim() || attachments.length)}
 	                        onSend={() => void sendMessage()}
 	                        onStop={() => void stopActiveRun()}
 	                      />
 	                    </div>
 	                  </div>
-	                  {attachments.length > 0 && (
-	                    <div className="attachment-chips" aria-label="已选择附件">
-	                      {attachments.map((file, index) => (
-	                        <span className="attachment-chip" key={`${file.name}-${file.size}-${index}`}>
-	                          <span>{file.name}</span>
-	                          <small>{formatFileSize(file.size)}</small>
-	                          <button onClick={() => removeAttachment(index)} aria-label={`移除 ${file.name}`}><X size={12} /></button>
-	                        </span>
-	                      ))}
-	                    </div>
-	                  )}
 	                </div>
                 )}
               </div>
@@ -5027,42 +5145,113 @@ function ThreadActionsMenu({ thread, workspace, vaults, activeVault, activeAgent
   onOpenAgents: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [popoverPosition, setPopoverPosition] = useState({ top: 0, right: 12, maxHeight: 320 });
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const threadIdRef = useRef(thread.id);
+  const popoverId = `thread-actions-popover-${thread.id}`;
   const followLabel = thread.followMode === 'conversation' ? '对话跟随' : '默认跟随';
   const workspaceLabel = thread.mode === 'workspace' ? workspace?.name || '项目对话' : '临时对话';
   const agentLabel = activeAgent?.name || '未选择 Agent';
+
+  const updatePopoverPosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const viewportPadding = 12;
+    const width = Math.min(286, Math.max(0, window.innerWidth - viewportPadding * 2));
+    const maximumRight = Math.max(viewportPadding, window.innerWidth - width - viewportPadding);
+    const right = Math.min(Math.max(viewportPadding, window.innerWidth - rect.right), maximumRight);
+    const top = rect.bottom + 6;
+    setPopoverPosition({
+      top,
+      right,
+      maxHeight: Math.max(120, window.innerHeight - top - viewportPadding),
+    });
+  }, []);
+
+  const closeMenu = useCallback((restoreFocus = true) => {
+    setOpen(false);
+    if (restoreFocus) window.requestAnimationFrame(() => triggerRef.current?.focus());
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return undefined;
+    updatePopoverPosition();
+    const popover = popoverRef.current;
+    if (popover && typeof popover.showPopover === 'function' && !popover.matches(':popover-open')) popover.showPopover();
+    const resizeObserver = new ResizeObserver(updatePopoverPosition);
+    if (triggerRef.current) resizeObserver.observe(triggerRef.current);
+    window.addEventListener('resize', updatePopoverPosition);
+    window.visualViewport?.addEventListener('resize', updatePopoverPosition);
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', updatePopoverPosition);
+      window.visualViewport?.removeEventListener('resize', updatePopoverPosition);
+    };
+  }, [open, updatePopoverPosition]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    popoverRef.current?.focus();
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
+      closeMenu();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeMenu();
+    };
+    window.addEventListener('pointerdown', handlePointerDown);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [closeMenu, open]);
+
+  useEffect(() => {
+    if (threadIdRef.current === thread.id) return;
+    threadIdRef.current = thread.id;
+    setOpen(false);
+  }, [thread.id]);
+
   return (
     <div className="thread-actions-menu">
-      <button className="top-icon-btn thread-actions-trigger" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-label="对话设置" title="对话设置">
+      <button ref={triggerRef} className="top-icon-btn thread-actions-trigger" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-controls={open ? popoverId : undefined} aria-haspopup="dialog" aria-label="对话设置" title="对话设置">
         <MoreHorizontal size={18} />
       </button>
-      {open && (
-        <div className="thread-actions-popover">
+      {open && createPortal(
+        <div ref={popoverRef} id={popoverId} className="thread-actions-popover" role="dialog" aria-label="对话设置" tabIndex={-1} popover="manual" style={popoverPosition}>
           <div className="thread-actions-summary">
             <strong>{followLabel} · {agentLabel}</strong>
             <span>{workspaceLabel}{activeVault ? ` · ${activeVault.name}` : ''}</span>
           </div>
           <div className="thread-menu-section">
             <span>跟随</span>
-            <button className={(thread.followMode || 'default') === 'default' ? 'selected' : ''} onClick={() => { setOpen(false); void onFollowModeChange('default'); }}>默认跟随</button>
-            <button className={thread.followMode === 'conversation' ? 'selected' : ''} onClick={() => { setOpen(false); void onFollowModeChange('conversation'); }}>对话跟随</button>
+            <button className={(thread.followMode || 'default') === 'default' ? 'selected' : ''} onClick={() => { closeMenu(false); void onFollowModeChange('default'); }}>默认跟随</button>
+            <button className={thread.followMode === 'conversation' ? 'selected' : ''} onClick={() => { closeMenu(false); void onFollowModeChange('conversation'); }}>对话跟随</button>
           </div>
           <div className="thread-menu-section">
             <span>项目</span>
             {thread.mode === 'workspace' ? (
-              <button onClick={() => { setOpen(false); void onCreateProjectThread(); }}><Plus size={15} />新建项目对话</button>
+              <button onClick={() => { closeMenu(false); void onCreateProjectThread(); }}><Plus size={15} />新建项目对话</button>
             ) : (
-              <button onClick={() => { setOpen(false); onConvertToProject(); }}><FolderOpen size={15} />转为项目</button>
+              <button onClick={() => { closeMenu(false); onConvertToProject(); }}><FolderOpen size={15} />转为项目</button>
             )}
           </div>
           <label className="thread-menu-select">
             <span>资料库</span>
-            <select value={thread.vaultId || ''} onChange={(event) => { setOpen(false); void onVaultChange(event.target.value || null); }}>
+            <select value={thread.vaultId || ''} onChange={(event) => { closeMenu(false); void onVaultChange(event.target.value || null); }}>
               <option value="">不连接资料库</option>
               {vaults.map((vault) => <option key={vault.id} value={vault.id}>{vault.name}</option>)}
             </select>
           </label>
-          <button className="thread-menu-wide" onClick={() => { setOpen(false); onOpenAgents(); }}><UserPlus size={15} />团队成员</button>
-        </div>
+          <button className="thread-menu-wide" onClick={() => { closeMenu(false); onOpenAgents(); }}><UserPlus size={15} />团队成员</button>
+        </div>,
+        document.body,
       )}
     </div>
   );
@@ -8729,6 +8918,144 @@ function MessageAvatar({ message, agents, userProfile }: { message: ChatEvent; a
   const agent = agents.find((item) => item.id === message.agentId);
   if (agent) return <AgentAvatar agent={agent} />;
   return <span className="agent-avatar" style={{ background: agentColor(agents, message.agentId) }}>{message.agentName.slice(0, 1)}</span>;
+}
+
+function isBrowserPreviewableImage(file: File) {
+  return ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type.toLowerCase());
+}
+
+function isInlineAttachmentImage(attachment: Attachment) {
+  return attachment.kind === 'image' && ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(attachment.mimeType.toLowerCase());
+}
+
+function attachmentKindLabel(kind: Attachment['kind']) {
+  if (kind === 'image') return '图片';
+  if (kind === 'text') return '文本';
+  if (kind === 'document') return '文档';
+  if (kind === 'audio') return '音频';
+  if (kind === 'video') return '视频';
+  return '压缩包';
+}
+
+function AttachmentTray({ attachments, notice, onRemove, onRetry }: { attachments: AttachmentDraft[]; notice: string; onRemove: (localId: string) => void; onRetry: (localId: string) => void }) {
+  if (!attachments.length && !notice) return null;
+  return (
+    <div className="attachment-tray-wrap">
+      {attachments.length > 0 && (
+        <div className="attachment-tray" aria-label="已选择附件">
+          {attachments.map((draft) => {
+            const attachment = draft.attachment;
+            const label = attachment ? attachmentKindLabel(attachment.kind) : '附件';
+            if (draft.previewUrl) {
+              return (
+                <div className={`attachment-preview-card ${draft.status}`} key={draft.localId}>
+                  <a href={draft.previewUrl} target="_blank" rel="noreferrer" aria-label={`查看 ${draft.file.name}`}><img src={draft.previewUrl} alt={draft.file.name} /></a>
+                  <button className="attachment-remove" onClick={() => onRemove(draft.localId)} aria-label={`移除 ${draft.file.name}`}><X size={13} /></button>
+                  <span>{draft.status === 'uploading' ? <><LoaderCircle className="spin" size={12} />上传中</> : draft.status === 'error' ? '上传失败' : draft.file.name}</span>
+                  {draft.status === 'error' && <button className="attachment-retry" onClick={() => onRetry(draft.localId)}><RefreshCw size={12} />重试</button>}
+                </div>
+              );
+            }
+            return (
+              <div className={`attachment-file-card ${draft.status}`} key={draft.localId}>
+                <span className="attachment-file-icon">{attachment?.kind === 'image' ? <Image size={20} /> : <FileText size={20} />}</span>
+                <span className="attachment-file-copy"><strong>{draft.file.name}</strong><small>{draft.status === 'uploading' ? '上传中…' : draft.status === 'error' ? draft.error || '上传失败' : `${label} · ${formatFileSize(draft.file.size)}`}</small></span>
+                {draft.status === 'error' && <button className="attachment-retry" onClick={() => onRetry(draft.localId)} aria-label={`重试 ${draft.file.name}`}><RefreshCw size={13} /></button>}
+                <button className="attachment-remove" onClick={() => onRemove(draft.localId)} aria-label={`移除 ${draft.file.name}`}><X size={13} /></button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {notice && <div className="attachment-notice" role="alert">{notice}</div>}
+    </div>
+  );
+}
+
+function MessageAttachments({ attachments }: { attachments: Attachment[] }) {
+  return (
+    <div className="message-attachments">
+      {attachments.map((attachment) => isInlineAttachmentImage(attachment) ? (
+        <MessageImageAttachment attachment={attachment} key={attachment.id} />
+      ) : (
+        <a className="message-attachment-file" href={attachment.contentUrl} target="_blank" rel="noreferrer" key={attachment.id}>
+          <FileText size={20} />
+          <span><strong>{attachment.name}</strong><small>{attachmentKindLabel(attachment.kind)} · {formatFileSize(attachment.size)}</small></span>
+        </a>
+      ))}
+    </div>
+  );
+}
+
+function MessageImageAttachment({ attachment }: { attachment: Attachment }) {
+  const [failed, setFailed] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const closePreview = useCallback(() => {
+    setPreviewOpen(false);
+    window.requestAnimationFrame(() => triggerRef.current?.focus());
+  }, []);
+  if (failed) {
+    return (
+      <a className="message-attachment-file message-attachment-image-error" href={attachment.contentUrl} target="_blank" rel="noreferrer">
+        <Image size={20} />
+        <span><strong>{attachment.name}</strong><small>图片加载失败 · 点击重试</small></span>
+      </a>
+    );
+  }
+  return (
+    <>
+      <button ref={triggerRef} className="message-attachment-image" type="button" aria-label={`预览 ${attachment.name}`} aria-haspopup="dialog" onClick={() => setPreviewOpen(true)}>
+        <img src={attachment.contentUrl} alt="" onError={() => setFailed(true)} />
+        <span>{attachment.name}</span>
+      </button>
+      {previewOpen && <ImageLightbox attachment={attachment} onClose={closePreview} />}
+    </>
+  );
+}
+
+function ImageLightbox({ attachment, onClose }: { attachment: Attachment; onClose: () => void }) {
+  const [closing, setClosing] = useState(false);
+  const closingRef = useRef(false);
+  const closeTimerRef = useRef<number | null>(null);
+  const requestClose = useCallback(() => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setClosing(true);
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    closeTimerRef.current = window.setTimeout(onClose, reduceMotion ? 0 : 140);
+  }, [onClose]);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const appRoot = document.getElementById('root');
+    const rootWasInert = appRoot?.hasAttribute('inert') || false;
+    document.body.style.overflow = 'hidden';
+    if (appRoot) appRoot.setAttribute('inert', '');
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      requestClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+      if (appRoot && !rootWasInert) appRoot.removeAttribute('inert');
+      if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+    };
+  }, [requestClose]);
+
+  return createPortal(
+    <div className={`image-lightbox ${closing ? 'closing' : ''}`} role="dialog" aria-modal="true" aria-label={`预览 ${attachment.name}`} onMouseDown={(event) => { if (event.target === event.currentTarget) requestClose(); }}>
+      <button className="image-lightbox-close" type="button" onClick={requestClose} aria-label="关闭图片预览" autoFocus><X size={22} /></button>
+      <figure className="image-lightbox-stage" onMouseDown={(event) => event.stopPropagation()}>
+        <img src={attachment.contentUrl} alt={attachment.name} />
+        <figcaption>{attachment.name}</figcaption>
+      </figure>
+    </div>,
+    document.body,
+  );
 }
 
 function MentionTextarea({ value, onChange, onSend, sendKey, agents, selectedAgentIds, placeholder }: {

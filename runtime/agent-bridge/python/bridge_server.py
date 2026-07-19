@@ -60,6 +60,7 @@ class BridgeServer:
             session_id = str(req.get("session_id") or "").strip() or uuid.uuid4().hex
             message = req.get("message", req.get("input", ""))
             storage_message = req.get("storage_message")
+            attachments = req.get("attachments")
             instructions = req.get("instructions") or req.get("system_message")
             conversation_history = req.get("conversation_history")
             profile = req.get("profile")
@@ -73,6 +74,7 @@ class BridgeServer:
                 session_id,
                 message,
                 storage_message,
+                attachments,
                 instructions,
                 conversation_history,
                 profile,

@@ -4,6 +4,18 @@ export type ApiError = {
   details?: Record<string, unknown>;
 };
 
+export type AttachmentKind = 'image' | 'text' | 'document' | 'audio' | 'video' | 'archive';
+
+export type Attachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  kind: AttachmentKind;
+  createdAt: string;
+  contentUrl: string;
+};
+
 export type ReleaseAsset = {
   name?: string;
   browser_download_url?: string;

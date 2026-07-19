@@ -2,18 +2,20 @@ import cors from 'cors';
 import express from 'express';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { access, appendFile, cp, mkdir, readdir, readFile, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 import { createTelemetryClient } from './telemetry.mjs';
 import { appUpdateStatus } from './lib/app-update.mjs';
 import { resolveAppVersion } from './lib/app-version.mjs';
+import { createAttachmentStore, MAX_ATTACHMENT_BYTES } from './lib/attachment-store.mjs';
 import { createSerialJsonWriter, readJsonWithRecovery } from './lib/atomic-json-store.mjs';
 import { createLocalSecurity } from './lib/local-security.mjs';
 import { resolveInsideRoot } from './lib/path-boundary.mjs';
@@ -45,8 +47,9 @@ const frakioRuntimeStagingRoot = path.join(frakioWorkHome, 'runtimes', '.staging
 const frakioRuntimeRegistryPath = path.join(frakioWorkHome, 'runtime', 'runtime-registry.json');
 const hermesAgentSourcePath = process.env.HERMES_AGENT_SOURCE || path.join(frakioWorkHome, 'sources', 'hermes-agent');
 const hermesAgentBackupRoot = path.join(frakioWorkHome, 'backups', 'hermes-agent');
+const attachmentRoot = path.join(frakioWorkHome, 'attachments');
 const officialHermesAgentRepo = 'https://github.com/NousResearch/hermes-agent.git';
-const frakioBridgeProtocolVersion = 1;
+const frakioBridgeProtocolVersion = 2;
 const requiredAiohttpVersion = '3.14.1';
 const hermesDbPath = hermesWebUiHome ? path.join(hermesWebUiHome, 'hermes-web-ui.db') : '';
 const telemetry = createTelemetryClient({
@@ -58,6 +61,8 @@ const telemetry = createTelemetryClient({
 });
 const writeStateJson = createSerialJsonWriter(statePath, { mode: 0o600 });
 const writeSecretsJson = createSerialJsonWriter(secretsPath, { mode: 0o600 });
+const attachmentStore = createAttachmentStore(attachmentRoot);
+void attachmentStore.cleanupOrphans().catch(() => {});
 let hermesApiProcess = null;
 let hermesBridgeProcess = null;
 const profileGatewayProcesses = new Set();
@@ -250,6 +255,51 @@ app.use(cors(localSecurity.corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.get('/api/session', localSecurity.sessionRoute);
 app.use('/api', localSecurity.protect);
+
+app.post('/api/attachments', express.raw({ type: () => true, limit: MAX_ATTACHMENT_BYTES }), async (req, res) => {
+  try {
+    const attachment = await attachmentStore.save({
+      name: String(req.query.name || ''),
+      mimeType: String(req.headers['content-type'] || ''),
+      data: req.body,
+    });
+    res.status(201).json({ attachment });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: String(error?.message || error), code: error.code || '' });
+  }
+});
+
+app.get('/api/attachments/:id/content', async (req, res) => {
+  try {
+    const { metadata, filePath, inline } = await attachmentStore.content(req.params.id);
+    res.type(metadata.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Length', String(metadata.size));
+    res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(metadata.name)}`);
+    await pipeline(createReadStream(filePath), res);
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error);
+      return;
+    }
+    res.status(error.status || 500).json({ error: String(error?.message || error), code: error.code || '' });
+  }
+});
+
+app.delete('/api/attachments/:id', async (req, res) => {
+  try {
+    await attachmentStore.removeDraft(req.params.id);
+    res.json({ ok: true, deletedAttachmentId: req.params.id });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: String(error?.message || error), code: error.code || '' });
+  }
+});
+
+app.use('/api/attachments', (error, _req, res, next) => {
+  if (error?.status === 413 || error?.type === 'entity.too.large') {
+    return res.status(413).json({ error: '单个附件不能超过 32 MiB。', code: 'attachment_too_large' });
+  }
+  return next(error);
+});
 
 const defaultAgents = [
   { id: 'iris', name: 'Iris', role: '书记官 / 默认入口', model: 'Hermes default', color: '#2563eb', soul: '冷静、细致，负责把混乱需求变成可执行 brief。', scope: '理解意图、整理 brief、记录结论、维护上下文。', source: 'demo' },
@@ -8086,6 +8136,7 @@ app.delete('/api/workspaces/:id', async (req, res) => {
   state.workspaces = state.workspaces.filter((item) => item.id !== workspace.id);
   if (state.defaultVaultId === workspace.vaultId) state.defaultVaultId = state.vaults.find((vault) => state.workspaces.some((item) => item.vaultId === vault.id))?.id || state.vaults[0]?.id || null;
   await writeState(state);
+  await attachmentStore.removeForThreads(deletedThreadIds);
   res.json({ ok: true, deletedWorkspaceId: workspace.id, deletedThreadIds });
 });
 
@@ -8277,6 +8328,7 @@ app.delete('/api/threads/:id', async (req, res) => {
       .sort(sortPinnedThenUpdated)[0] || null;
   }
   await writeState(state);
+  await attachmentStore.removeForThreads([thread.id]);
   res.json({ ok: true, deletedThreadId: thread.id, nextThreadId: nextThread?.id || null, nextThread: nextThread ? summarizeThread(nextThread, state) : null });
 });
 
@@ -8777,14 +8829,34 @@ async function runAgentRoomChat(req, res) {
   res.json({ taskType, thread, contextPacket, events, proposals, workflow, vaultSummary: summary, notice: providerNotice ? `${providerNotice}。已回退到本地 Agent 编排。` : '' });
 }
 
-function threadHistoryForHermes(thread) {
-  return (thread.messages || [])
-    .filter((message) => message.agentId !== 'system' && message.content)
-    .slice(-20)
-    .map((message) => ({
-      role: message.agentId === 'user' ? 'user' : 'assistant',
-      content: String(message.content || ''),
+async function threadHistoryForHermes(thread) {
+  const messages = (thread.messages || [])
+    .filter((message) => message.agentId !== 'system' && (message.content || message.attachments?.length))
+    .slice(-20);
+  return Promise.all(messages.map(async (message) => {
+    const attachments = await Promise.all((message.attachments || []).map(async (attachment) => {
+      try {
+        const { filePath } = await attachmentStore.content(attachment.id);
+        return { ...attachment, path: filePath };
+      } catch {
+        return attachment;
+      }
     }));
+    return {
+      role: message.agentId === 'user' ? 'user' : 'assistant',
+      content: hermesStoredMessageContent(message.content, attachments),
+    };
+  }));
+}
+
+function attachmentPromptLine(attachment) {
+  return `[Attached ${attachment.kind || 'file'}: ${attachment.name} (${attachment.mimeType || 'application/octet-stream'}, ${attachment.size || 0} bytes) at ${attachment.path || attachment.contentUrl || ''}]`;
+}
+
+function hermesStoredMessageContent(content, attachments = []) {
+  const text = String(content || '').trim();
+  const lines = (attachments || []).map(attachmentPromptLine);
+  return [text, ...lines].filter(Boolean).join('\n\n') || '请查看并处理这些附件。';
 }
 
 function trimLeadingBlankLines(text) {
@@ -9211,7 +9283,8 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     const thread = state.threads.find((item) => item.id === req.params.id);
     if (!thread) return res.status(404).json({ error: '会话不存在。' });
     const message = String(req.body?.message || '').trim();
-    if (!message) return res.status(400).json({ error: '消息为空。' });
+    const attachmentMetadata = await attachmentStore.resolveMany(req.body?.attachmentIds);
+    if (!message && !attachmentMetadata.length) return res.status(400).json({ error: '消息和附件不能同时为空。' });
     let bridge = null;
     try {
       const started = await startHermesBridge();
@@ -9225,7 +9298,8 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     const selectedAgents = state.agents.filter((agent) => selected.includes(agent.id));
     const primaryAgent = resolveRunTargetAgent(state, thread, req.body?.targetAgentId, selectedAgents);
     if (!primaryAgent) return res.status(400).json({ error: '没有可用的 Agent。' });
-    const mentionedAgents = matchMentionedAgents(message, state.agents, selected, resolveDefaultAgentId(state));
+    const routingMessage = message || '请查看并处理这些附件。';
+    const mentionedAgents = matchMentionedAgents(routingMessage, state.agents, selected, resolveDefaultAgentId(state));
     const explicitlyMentionedPrimaryAgent = !isAllAgentsMentioned(message) && mentionedAgents.some((agent) => agent.id === primaryAgent.id);
     const selectedAgentIds = Array.from(new Set([...selected, primaryAgent.id].filter((agentId) => state.agents.some((agent) => agent.id === agentId))));
     const profileName = await resolveHermesProfileNameForAgent(primaryAgent);
@@ -9241,12 +9315,13 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       throw error;
     }
     const sessionId = thread.externalSessionId || `workbench-${thread.id}`;
-    const userMessage = { id: id('msg'), agentId: 'user', agentName: '你', role: 'Workspace Owner', content: message };
+    const userMessage = { id: id('msg'), agentId: 'user', agentName: '你', role: 'Workspace Owner', content: message, attachments: attachmentMetadata.map(attachmentStore.publicAttachment) };
+    await attachmentStore.claim(attachmentMetadata, thread.id, userMessage.id);
     if (!(thread.messages || []).some((item) => item.content === message && item.agentId === 'user' && String(item.id).startsWith('local-'))) {
       thread.messages = [...(thread.messages || []), userMessage];
     }
     thread.runStatus = 'running';
-    thread.workflowState = [{ title: 'Hermes Agent 开始执行', status: 'running', source: 'run', detail: message.slice(0, 80), updatedAt: now() }];
+    thread.workflowState = [{ title: 'Hermes Agent 开始执行', status: 'running', source: 'run', detail: (message || attachmentMetadata.map((item) => item.name).join('、')).slice(0, 80), updatedAt: now() }];
     thread.workflow = thread.workflowState.map((step) => step.title);
     thread.selectedAgents = selectedAgentIds;
     thread.externalSessionId = sessionId;
@@ -9262,12 +9337,17 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     thread.updatedAt = now();
     await writeState(state);
 
+    const bridgeAttachments = await Promise.all(attachmentMetadata.map(async (metadata) => {
+      const { filePath } = await attachmentStore.content(metadata.id);
+      return { id: metadata.id, name: metadata.name, mime_type: metadata.mimeType, size: metadata.size, kind: metadata.kind, path: filePath };
+    }));
     const started = await requestHermesBridge({
       action: 'chat',
       session_id: sessionId,
-      message,
-      storage_message: message,
-      conversation_history: threadHistoryForHermes({ ...thread, messages: (thread.messages || []).slice(0, -1) }),
+      message: routingMessage,
+      storage_message: hermesStoredMessageContent(message, bridgeAttachments),
+      attachments: bridgeAttachments,
+      conversation_history: await threadHistoryForHermes({ ...thread, messages: (thread.messages || []).slice(0, -1) }),
       profile: profileName,
       model: runModel.model || undefined,
       provider: runModel.provider || undefined,
@@ -9289,6 +9369,7 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     }
     captureTelemetry('agent_run_started', {
       agent_count: selectedAgentIds.length,
+      attachment_count: attachmentMetadata.length,
       permission_mode: thread.permissionMode || req.body?.permissionMode || 'manual',
       route_reason: explicitlyMentionedPrimaryAgent ? 'user_mention' : thread.followMode === 'conversation' ? 'conversation_follow' : 'default_agent',
     });

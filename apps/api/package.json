@@ -1,10 +1,11 @@
 {
   "name": "@frakio/api",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node server.mjs"
+    "dev": "node server.mjs",
+    "test": "node --test lib/*.test.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",
