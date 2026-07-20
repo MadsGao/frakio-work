@@ -3,6 +3,11 @@
 [English](README.en.md)
 
 Frakio Work 是一个以 Hermes Agent 为核心的多 Agent 工作台，我个人使用过网络上的各种 Hermes Web Ui 以及第三方客户端，但都无法满足我的协作需求，当然还有界面说实话挺丑的，并不满足我的审美，所以这也是 Frakio Work 诞生的起因。
+
+# 沟通群
+
+![主界面](docs/assets/readme/qrcode_1784508398505.jpg)
+
 ## 快速配置
 
 如果你只是想直接使用 Frakio Work，推荐下载桌面版。打开 [GitHub Releases](https://github.com/MadsGao/frakio-work/releases)，下载与你电脑架构匹配的 DMG。Apple Silicon 机型下载 `arm64`，Intel 机型下载 `x64`。当前 macOS 安装包尚未经 Apple 签名与公证，首次打开时如果系统提示无法验证开发者，请在 Finder 中右键 Frakio Work，选择“打开”。
