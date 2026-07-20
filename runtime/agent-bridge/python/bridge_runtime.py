@@ -430,8 +430,7 @@ def _profile_home(profile: str | None) -> Path:
     base = _base_hermes_home()
     if not profile or profile == "default":
         return base
-    profile_home = base / "profiles" / profile
-    return profile_home if profile_home.exists() else base
+    return base / "profiles" / profile
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:

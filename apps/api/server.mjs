@@ -18,6 +18,7 @@ import { resolveAppVersion } from './lib/app-version.mjs';
 import { createAttachmentStore, MAX_ATTACHMENT_BYTES } from './lib/attachment-store.mjs';
 import { createSerialJsonWriter, readJsonWithRecovery } from './lib/atomic-json-store.mjs';
 import { createLocalSecurity } from './lib/local-security.mjs';
+import { isSystemHermesProfile, resolveDeletableHermesProfileDir, userVisibleHermesProfiles } from './lib/hermes-profile-safety.mjs';
 import { resolveInsideRoot } from './lib/path-boundary.mjs';
 import { resolveCommand as resolvePlatformCommand, runtimePlatformDir } from './lib/platform.mjs';
 
@@ -951,7 +952,8 @@ function normalizeSpace(space = {}, fallbackName = 'Frakio Work') {
 function normalizeState(state) {
   const base = defaultState();
   const { divisions: _legacyDivisions, orgEdges: _legacyOrgEdges, ...stateWithoutDivisions } = state || {};
-  const agents = state.agents?.length ? state.agents : base.agents;
+  const sourceAgents = state.agents?.length ? state.agents : base.agents;
+  const agents = sourceAgents.filter((agent) => !isSystemHermesProfile(agent.profileName, agent.id));
   const agentIds = new Set(agents.map((agent) => agent.id));
   const defaultAgentId = resolveDefaultAgentId(state, agents);
   const sourceVaults = Array.isArray(state.vaults) ? state.vaults : base.vaults;
@@ -3513,7 +3515,7 @@ async function repairHermesProfilesFromState(state) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   for (const agent of state.agents || []) {
     const profileName = slug(agent.profileName || agent.id || '');
-    if (!profileName || profileName === 'hermes-default') continue;
+    if (!profileName || isSystemHermesProfile(profileName, agent.id)) continue;
     const dir = await profileDirForName(profileName);
     if (!dir) continue;
 
@@ -3551,9 +3553,13 @@ async function repairHermesProfilesFromState(state) {
 async function syncHermesProfilesToState(state, discovery = null) {
   const repair = await repairHermesProfilesFromState(state);
   const bootstrap = discovery || await discoverHermesBootstrap();
-  const importedProfileNames = new Set(state.integrations.hermesAgent?.importedProfileNames || state.integrations.hermesStudio?.importedProfileNames || []);
+  const importedProfileNames = new Set(
+    (state.integrations.hermesAgent?.importedProfileNames || state.integrations.hermesStudio?.importedProfileNames || [])
+      .filter((name) => !isSystemHermesProfile(name)),
+  );
+  const visibleProfiles = userVisibleHermesProfiles(bootstrap.profiles);
 
-  for (const profile of bootstrap.profiles) {
+  for (const profile of visibleProfiles) {
     const canonicalAgentId = profile.name === 'default' ? 'hermes-default' : slug(profile.name);
     const existingAgent = state.agents.find((agent) => agent.profileName === profile.name || agent.id === canonicalAgentId || agent.id === slug(profile.name));
     const nextAgent = { ...agentFromProfile(profile, existingAgent), source: 'hermes-profile' };
@@ -3576,7 +3582,7 @@ async function syncHermesProfilesToState(state, discovery = null) {
     importedProfileNames: Array.from(importedProfileNames).sort(),
   };
   bootstrap.repair = repair;
-  return { state, importedProfiles: bootstrap.profiles.map((profile) => profile.name), bootstrap, repair };
+  return { state, importedProfiles: visibleProfiles.map((profile) => profile.name), bootstrap, repair };
 }
 
 function profileColor(profile) {
@@ -4838,6 +4844,7 @@ async function resolveProfileTextFile(profileName, kind, moduleName = '') {
 }
 
 async function syncProfileAgent(profileName) {
+  if (isSystemHermesProfile(profileName)) return { profile: null, agent: null };
   const profiles = await readHermesProfiles();
   const profile = profiles.find((item) => item.name === profileName);
   if (!profile) return { profile: null, agent: null };
@@ -5351,9 +5358,9 @@ app.get('/api/hermes-local/status', async (_req, res) => {
 app.post('/api/hermes-local/import', async (req, res) => {
   const discovery = await discoverHermesStudio();
   const requested = Array.isArray(req.body?.profiles) && req.body.profiles.length ? new Set(req.body.profiles.map(String)) : null;
-  const profiles = discovery.profiles.filter((profile) => !requested || requested.has(profile.name));
+  const profiles = userVisibleHermesProfiles(discovery.profiles).filter((profile) => !requested || requested.has(profile.name));
   const state = await readState();
-  const importedProfileNames = new Set(state.integrations.hermesStudio.importedProfileNames || []);
+  const importedProfileNames = new Set((state.integrations.hermesStudio.importedProfileNames || []).filter((name) => !isSystemHermesProfile(name)));
   state.models = normalizeModels(state.models).filter((model) => !isBadHermesStudioModel(model) && model.source !== 'hermes-profile');
 
   for (const profile of profiles) {
@@ -7764,20 +7771,25 @@ app.post('/api/agents', async (req, res) => {
 
 app.delete('/api/agents/:id', async (req, res) => {
   try {
+    if (isSystemHermesProfile('', req.params.id)) {
+      return res.status(409).json({ error: 'Hermes Default 是受保护的系统 Profile。', code: 'system_profile_protected' });
+    }
     const state = await readState();
     const agent = state.agents.find((item) => item.id === req.params.id);
     if (!agent) return res.status(404).json({ error: 'Agent 不存在。' });
     const profileName = agent.profileName || '';
-    const profileDir = profileName ? await profileDirForName(profileName) : null;
+    if (isSystemHermesProfile(profileName, agent.id)) {
+      return res.status(409).json({ error: 'Hermes Default 是受保护的系统 Profile。', code: 'system_profile_protected' });
+    }
+    const profileDir = profileName ? resolveDeletableHermesProfileDir(hermesHome, profileName) : null;
     if (profileDir) {
-      if (!isInside(hermesHome, profileDir)) return res.status(403).json({ error: 'Profile 路径超出 Hermes Home。' });
       await rm(profileDir, { recursive: true, force: true });
     }
     state.agents = state.agents.filter((item) => item.id !== agent.id);
     await writeState(state);
     res.json({ ok: true, deletedAgentId: agent.id, deletedProfileName: profileName, agents: state.agents });
   } catch (error) {
-    res.status(error.status || 500).json({ error: error.message || 'Agent 删除失败。' });
+    res.status(error.status || 500).json({ error: error.message || 'Agent 删除失败。', ...(error.code ? { code: error.code } : {}) });
   }
 });
 
@@ -8637,7 +8649,13 @@ async function resolveThreadRunModelConfig(state, thread, agent, profileName) {
 
 async function resolveHermesProfileNameForAgent(agent) {
   const profiles = await readHermesProfiles();
-  if (agent?.profileName && profiles.some((profile) => profile.name === agent.profileName)) return agent.profileName;
+  if (agent?.profileName) {
+    if (profiles.some((profile) => profile.name === agent.profileName)) return agent.profileName;
+    const error = new Error(`Agent Profile「${agent.profileName}」配置缺失。`);
+    error.status = 409;
+    error.code = 'agent_profile_missing';
+    throw error;
+  }
   if (agent?.id && profiles.some((profile) => profile.name === agent.id)) return agent.id;
   const normalizedName = String(agent?.name || '').trim().toLowerCase();
   const byName = profiles.find((profile) => profile.name.toLowerCase() === normalizedName);
