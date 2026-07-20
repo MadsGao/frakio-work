@@ -1,6 +1,26 @@
-# Frakio Work
+<div align="center">
 
-[English](README.en.md)
+<img src="docs/assets/readme/72e3a0fe-eb3d-485a-9c5c-6456e4ed25a6.png" alt="Frakio Work Logo" width="100">
+
+<h1>Frakio Work</h1>
+
+<p>
+  基于 Hermes Agent 的多 Agent 协作工作台
+</p>
+
+<p>
+  <a href="https://madsgogo.com">🌱 作者主页</a>
+  ·
+  <a href="https://madsgogo.life">📚 博客</a>
+  ·
+  <a href="https://qm.qq.com/q/EMhcKWipnW">💬 QQ交流群</a>
+  ·
+  <a href="README.md">🇨🇳 中文</a>
+  ·
+  <a href="README.en.md">🇺🇸 English</a>
+</p>
+
+</div>
 
 Frakio Work 是一个以 Hermes Agent 为核心的多 Agent 工作台，我个人使用过网络上的各种 Hermes Web Ui 以及第三方客户端，但都无法满足我的协作需求，当然还有界面说实话挺丑的，并不满足我的审美，所以这也是 Frakio Work 诞生的起因。
 
