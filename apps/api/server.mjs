@@ -17,10 +17,16 @@ import { appUpdateStatus } from './lib/app-update.mjs';
 import { resolveAppVersion } from './lib/app-version.mjs';
 import { createAttachmentStore, MAX_ATTACHMENT_BYTES } from './lib/attachment-store.mjs';
 import { createSerialJsonWriter, readJsonWithRecovery } from './lib/atomic-json-store.mjs';
+import { probeResponsesCapabilities } from './lib/capability-probe.mjs';
 import { createLocalSecurity } from './lib/local-security.mjs';
 import { isSystemHermesProfile, resolveDeletableHermesProfileDir, userVisibleHermesProfiles } from './lib/hermes-profile-safety.mjs';
 import { resolveInsideRoot } from './lib/path-boundary.mjs';
 import { resolveCommand as resolvePlatformCommand, runtimePlatformDir } from './lib/platform.mjs';
+import { capabilitiesForModels, mapRunSettings, normalizeCapabilityOverrides, resolveModelCapability } from './lib/model-capabilities.mjs';
+import { CHAT_THINKING_FORMATS, candidateModelUrls } from './lib/provider-adapters.mjs';
+import { catalogStatus, flattenProviderCatalog, parseCatalogResponse, parseModelIds, readCatalogCache, recordActiveProbeCapability, recordCatalogError, updateProviderCatalog, verificationKey, writeCatalogCache } from './lib/model-catalog-store.mjs';
+import { fetchCodexOAuthCatalog } from './lib/oauth-provider-catalog.mjs';
+import { runtimeStep, summarizeRuntimeAutoStart } from './lib/runtime-autostart.mjs';
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
@@ -34,6 +40,7 @@ const appRoot = process.env.FRAKIO_WORK_APP_ROOT || projectRoot;
 const statePath = process.env.FRAKIO_WORK_STATE_PATH || path.join(frakioWorkHome, 'data/workbench-state.json');
 const secretsPath = process.env.FRAKIO_WORK_SECRETS_PATH || path.join(frakioWorkHome, 'data/model-secrets.json');
 const telemetryPath = process.env.FRAKIO_WORK_TELEMETRY_PATH || path.join(frakioWorkHome, 'data/telemetry.json');
+const modelCatalogCachePath = process.env.FRAKIO_WORK_MODEL_CATALOG_PATH || path.join(frakioWorkHome, 'data/model-catalog-cache.json');
 const defaultProjectsRoot = process.env.FRAKIO_WORK_PROJECTS_ROOT || path.join(frakioWorkHome, 'projects');
 const webDistPath = process.env.FRAKIO_WORK_WEB_DIST || path.join(appRoot, 'dist');
 const hermesWebUiHome = String(process.env.HERMES_WEB_UI_HOME || '').trim();
@@ -63,6 +70,7 @@ const telemetry = createTelemetryClient({
 const writeStateJson = createSerialJsonWriter(statePath, { mode: 0o600 });
 const writeSecretsJson = createSerialJsonWriter(secretsPath, { mode: 0o600 });
 const attachmentStore = createAttachmentStore(attachmentRoot);
+const modelCatalogCache = readCatalogCache(modelCatalogCachePath);
 void attachmentStore.cleanupOrphans().catch(() => {});
 let hermesApiProcess = null;
 let hermesBridgeProcess = null;
@@ -77,6 +85,7 @@ let hermesAutoStartState = {
   steps: [],
   logs: [],
   error: '',
+  warnings: [],
 };
 const providerEnvMap = {
   openai: { apiKey: 'OPENAI_API_KEY', baseUrl: 'OPENAI_BASE_URL' },
@@ -159,9 +168,11 @@ const providerAuthTypeMap = {
   'google-gemini-cli': 'gemini-loopback',
   'openai-codex': 'codex-device',
 };
+const compatibilityOnlyProviderKeys = new Set(['ikuncode', 'fun-codex', 'fun-claude']);
 const fallbackProviderPresets = [
-  { label: 'Codex-apikey.fun', value: 'fun-codex', builtin: true, baseUrl: 'https://api.apikey.fun/v1', apiMode: 'codex_responses', models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark'] },
-  { label: 'Claude-apikey.fun', value: 'fun-claude', builtin: true, baseUrl: 'https://api.apikey.fun', apiMode: 'anthropic_messages', models: ['claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
+  { label: 'IkunCode', value: 'ikuncode', builtin: true, selectable: false, baseUrl: 'https://api.ikuncode.cc/v1', apiMode: 'codex_responses', models: ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.5', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'] },
+  { label: 'Codex-apikey.fun', value: 'fun-codex', builtin: true, selectable: false, baseUrl: 'https://api.apikey.fun/v1', apiMode: 'codex_responses', models: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark'] },
+  { label: 'Claude-apikey.fun', value: 'fun-claude', builtin: true, selectable: false, baseUrl: 'https://api.apikey.fun', apiMode: 'anthropic_messages', models: ['claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
   { label: 'LM Studio', value: 'lmstudio', builtin: true, baseUrl: 'http://127.0.0.1:1234/v1', apiMode: 'chat_completions', models: [] },
   { label: 'Anthropic', value: 'anthropic', builtin: true, baseUrl: 'https://api.anthropic.com', apiMode: 'anthropic_messages', models: ['claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'] },
   { label: 'Claude OAuth', value: 'claude-oauth', builtin: true, baseUrl: 'https://api.anthropic.com', apiMode: 'anthropic_messages', authType: 'claude-pkce', models: ['claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
@@ -192,11 +203,21 @@ function normalizeProviderPreset(raw = {}) {
     label: String(raw.label || value).trim(),
     value,
     builtin: raw.builtin !== false,
+    selectable: raw.selectable !== false && !compatibilityOnlyProviderKeys.has(value),
     baseUrl: String(raw.baseUrl || raw.base_url || '').trim(),
     apiMode: normalizeApiMode(raw.apiMode || raw.api_mode || (value === 'openai-codex' ? 'codex_responses' : '')),
     ...(providerAuthTypeMap[value] ? { authType: providerAuthTypeMap[value] } : {}),
     models: Array.isArray(raw.models) ? raw.models.map((model) => String(model || '').trim()).filter(Boolean) : [],
   };
+}
+function withCompatibilityProviderPresets(rawPresets = []) {
+  const presets = rawPresets.map(normalizeProviderPreset);
+  const knownKeys = new Set(presets.map((preset) => preset.value));
+  for (const fallback of fallbackProviderPresets) {
+    if (!compatibilityOnlyProviderKeys.has(fallback.value) || knownKeys.has(fallback.value)) continue;
+    presets.push(normalizeProviderPreset(fallback));
+  }
+  return presets;
 }
 function loadProviderPresets() {
   try {
@@ -204,9 +225,9 @@ function loadProviderPresets() {
     const source = readFileSync(externalProviderPresetSource, 'utf8');
     const match = source.match(/export const PROVIDER_PRESETS: ProviderPreset\[] = (\[[\s\S]*?\n\])/);
     if (!match) throw new Error('PROVIDER_PRESETS not found');
-    return Function(`return ${match[1]}`)().map(normalizeProviderPreset);
+    return withCompatibilityProviderPresets(Function(`return ${match[1]}`)());
   } catch {
-    return fallbackProviderPresets.map(normalizeProviderPreset);
+    return withCompatibilityProviderPresets(fallbackProviderPresets);
   }
 }
 const oauthProviderKeys = new Set(Object.keys(providerAuthTypeMap));
@@ -302,7 +323,7 @@ app.use('/api/attachments', (error, _req, res, next) => {
   return next(error);
 });
 
-const defaultAgents = [
+const legacyDemoAgents = [
   { id: 'iris', name: 'Iris', role: '书记官 / 默认入口', model: 'Hermes default', color: '#2563eb', soul: '冷静、细致，负责把混乱需求变成可执行 brief。', scope: '理解意图、整理 brief、记录结论、维护上下文。', source: 'demo' },
   { id: 'max', name: 'Max', role: 'CEO / 调度裁决', model: 'Hermes reasoning', color: '#111827', soul: '判断优先级，压住复杂度，只推动下一步可确认动作。', scope: '拆解目标、分派 Agent、处理冲突、形成最终裁决。', source: 'demo' },
   { id: 'nora', name: 'Nora', role: '电商总监', model: 'Hermes commerce', color: '#0f766e', soul: '站在生意结果看产品、用户、转化和售后。', scope: '选品、Listing、店铺运营、客服、产品商业判断。', source: 'demo' },
@@ -311,7 +332,7 @@ const defaultAgents = [
   { id: 'victor', name: 'Victor', role: '技术总监', model: 'Hermes technical', color: '#475569', soul: '守住技术边界，处理建站、自动化和发布风险。', scope: '建站、自动化、数据同步、Shopify 发布和技术风险。', source: 'demo' },
 ];
 
-const defaultModels = [
+const legacyDefaultModels = [
   { id: 'model_default_deepseek_v4_flash', name: 'DeepSeek chat', provider: 'DeepSeek', kind: 'official', protocol: 'OpenAI Compatible', model: 'deepseek-chat', models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-pro', 'deepseek-v4-flash'], baseUrl: 'https://api.deepseek.com', apiKey: '', apiKeyState: '', source: 'default', pricing: { input: 0.27, output: 1.1, cacheRead: 0.07, cacheCreation: 0.27 } },
   { id: 'model_hermes_default', name: 'Hermes default', provider: 'Hermes', kind: 'official', protocol: 'OpenAI Compatible', model: 'hermes-default', baseUrl: '', apiKey: '', source: 'demo' },
   { id: 'model_hermes_reasoning', name: 'Hermes reasoning', provider: 'Hermes', kind: 'official', protocol: 'OpenAI Compatible', model: 'hermes-reasoning', baseUrl: '', apiKey: '', source: 'demo' },
@@ -326,6 +347,10 @@ const workflows = {
   knowledge: ['读取 Obsidian 规则', '检索项目资料', '回答并显示来源'],
 };
 const defaultCouncilWorkflowSignature = workflows.council.join('\u0000');
+const legacyWelcomeMessages = [
+  { id: 'start-iris', agentId: 'iris', agentName: 'Iris', role: '书记官 / 默认入口', content: 'Workspace 已开启。我会先把需求整理成可执行 brief，再交给 Max 判断是否需要更多 Agent 参与。' },
+  { id: 'start-max', agentId: 'max', agentName: 'Max', role: 'CEO / 调度裁决', content: '第一版按简单原则运行：能用一个 Workspace 解决，就不新增实体。能用确认队列解决，就不把权限散到各功能里。' },
+];
 
 const defaultPinnedNav = {
   knowledge: true,
@@ -735,11 +760,9 @@ function runTelemetryProperties(thread) {
 }
 
 function defaultState() {
-  const vaultId = 'vault_creative_ai_team';
-  const threadId = 'thread_default';
   return {
     version: 2,
-    ui: { libraryCollapsed: false, pinnedNav: defaultPinnedNav, defaultAgentId: 'iris', density: 'comfortable', streamingResponses: true, showReasoning: true, telemetryEnabled: false, telemetryNoticeSeenAt: '' },
+    ui: { libraryCollapsed: false, pinnedNav: defaultPinnedNav, defaultAgentId: '', defaultModel: '', density: 'comfortable', streamingResponses: true, showReasoning: true, telemetryEnabled: false, telemetryNoticeSeenAt: '' },
     userProfile: { avatarUrl: '', nickname: '', bio: '', age: '', hobbies: '', occupation: '', defaultAgentAddress: '', otherAgentAddress: '', completedAt: '', updatedAt: '' },
     observability: { modelUsage: [], systemEvents: [] },
     integrations: {
@@ -761,51 +784,13 @@ function defaultState() {
         gatewayAutoStart: { enabled: true, management: 'per_profile', include: [], exclude: [] },
       },
     },
-    defaultVaultId: vaultId,
-    agents: defaultAgents,
-    models: defaultModels,
+    defaultVaultId: null,
+    agents: [],
+    models: [],
     spaces: [{ id: 'space_default', name: 'Frakio Work', iconKind: 'dot', iconValue: '', theme: defaultSpaceTheme, archivedAt: null, createdAt: now(), updatedAt: now(), lastOpenedAt: now() }],
-    workspaces: [{ id: 'workspace_default', spaceId: 'space_default', name: 'Frakio Work', rootPath: defaultVaultPath, vaultId, environment: 'local', activeThreadId: threadId, archivedAt: null, pinnedAt: null, createdAt: now(), updatedAt: now() }],
-    vaults: [
-      {
-        id: vaultId,
-        name: '示例知识库',
-        path: defaultVaultPath,
-        status: 'not_indexed',
-        documentCount: 0,
-        productCount: 0,
-        lastIndexedAt: null,
-        needsRefresh: false,
-        index: null,
-      },
-    ],
-    threads: [
-      {
-        id: threadId,
-        spaceId: 'space_default',
-        workspaceId: 'workspace_default',
-        mode: 'workspace',
-        primaryAgentId: 'iris',
-        defaultAgentId: 'iris',
-        activeAgentId: 'iris',
-        followMode: 'default',
-        title: '欢迎使用 Frakio Work',
-        vaultId,
-        selectedAgents: ['iris', 'max'],
-        permissionMode: 'manual',
-        updatedAt: now(),
-        workflow: workflows.council,
-        proposals: [],
-        contextPacket: null,
-        messages: [
-          { id: 'start-iris', agentId: 'iris', agentName: 'Iris', role: '书记官 / 默认入口', content: 'Workspace 已开启。我会先把需求整理成可执行 brief，再交给 Max 判断是否需要更多 Agent 参与。' },
-          { id: 'start-max', agentId: 'max', agentName: 'Max', role: 'CEO / 调度裁决', content: '第一版按简单原则运行：能用一个 Workspace 解决，就不新增实体。能用确认队列解决，就不把权限散到各功能里。' },
-        ],
-        engine: 'simulate',
-        externalSessionId: null,
-        runStatus: 'idle',
-      },
-    ],
+    workspaces: [{ id: 'workspace_default', spaceId: 'space_default', name: 'Frakio Work', rootPath: defaultVaultPath, vaultId: null, environment: 'local', activeThreadId: null, archivedAt: null, pinnedAt: null, createdAt: now(), updatedAt: now() }],
+    vaults: [],
+    threads: [],
   };
 }
 
@@ -952,7 +937,7 @@ function normalizeSpace(space = {}, fallbackName = 'Frakio Work') {
 function normalizeState(state) {
   const base = defaultState();
   const { divisions: _legacyDivisions, orgEdges: _legacyOrgEdges, ...stateWithoutDivisions } = state || {};
-  const sourceAgents = state.agents?.length ? state.agents : base.agents;
+  const sourceAgents = Array.isArray(state.agents) ? state.agents : base.agents;
   const agents = sourceAgents.filter((agent) => !isSystemHermesProfile(agent.profileName, agent.id));
   const agentIds = new Set(agents.map((agent) => agent.id));
   const defaultAgentId = resolveDefaultAgentId(state, agents);
@@ -988,13 +973,10 @@ function normalizeState(state) {
     };
   });
   const workspaceById = new Map(normalizedWorkspaces.map((workspace) => [workspace.id, workspace]));
-  const normalizedModels = normalizeModels(state.models?.length ? state.models : base.models).filter((model) => !isBadHermesStudioModel(model) && !isPlaceholderModel(model) && model.source !== 'hermes-profile');
-  if (!normalizedModels.some((model) => model.id === 'model_default_deepseek_v4_flash')) {
-    normalizedModels.push(normalizeModel(defaultModels[0]));
-  }
+  const normalizedModels = normalizeModels(Array.isArray(state.models) ? state.models : base.models).filter((model) => !isBadHermesStudioModel(model) && !isPlaceholderModel(model) && model.source !== 'hermes-profile');
   const defaultModel = normalizedModels.some((model) => model.id === state.ui?.defaultModel)
     ? state.ui.defaultModel
-    : normalizedModels.find((model) => model.id === 'model_default_deepseek_v4_flash')?.id || state.ui?.defaultModel || '';
+    : '';
   return {
     ...base,
     ...stateWithoutDivisions,
@@ -1038,7 +1020,7 @@ function normalizeState(state) {
       avatarUrl: agent.avatarUrl || '',
     })),
     vaults: sourceVaults,
-    threads: (state.threads?.length ? state.threads : base.threads).map((thread) => {
+    threads: (Array.isArray(state.threads) ? state.threads : base.threads).map((thread) => {
       const hasVaultId = Object.prototype.hasOwnProperty.call(thread, 'vaultId');
       return {
       ...thread,
@@ -1057,8 +1039,9 @@ function normalizeState(state) {
           ? (sourceVaults.some((item) => item.id === thread.vaultId) ? thread.vaultId : null)
           : (workspaceById.get(thread.workspaceId)?.vaultId || normalizedWorkspaces[0]?.vaultId || null),
       permissionMode: ['manual', 'smart', 'off'].includes(thread.permissionMode) ? thread.permissionMode : 'manual',
-      selectedAgents: Array.isArray(thread.selectedAgents) && thread.selectedAgents.length ? thread.selectedAgents : ['iris', 'max'],
+      selectedAgents: Array.isArray(thread.selectedAgents) ? thread.selectedAgents.filter((agentId) => agentIds.has(agentId)) : [],
       agentModelOverrides: normalizeAgentModelOverrides(thread.agentModelOverrides, agents, normalizedModels),
+      agentRunOverrides: normalizeAgentRunOverrides(thread.agentRunOverrides, agents),
       workflow: Array.isArray(thread.workflow) ? thread.workflow : [],
       proposals: Array.isArray(thread.proposals) ? thread.proposals : [],
       messages: Array.isArray(thread.messages) ? thread.messages : [],
@@ -1101,6 +1084,23 @@ function normalizeAgentModelOverrides(overrides, agents = [], models = []) {
     const selectedName = modelName || model.model || availableNames[0] || '';
     if (!selectedName || !availableNames.includes(selectedName)) continue;
     normalized.push([agentId, `${model.id}::${selectedName}`]);
+  }
+  return Object.fromEntries(normalized);
+}
+
+function normalizeAgentRunOverrides(overrides, agents = []) {
+  const agentIds = new Set((agents || []).map((agent) => agent.id));
+  const normalized = [];
+  for (const [agentId, raw] of Object.entries(overrides && typeof overrides === 'object' ? overrides : {})) {
+    if (!agentIds.has(agentId) || !raw || typeof raw !== 'object') continue;
+    const reasoningEffortRaw = String(raw.reasoningEffort || '').trim().toLowerCase().slice(0, 40);
+    const reasoningEffort = /^[a-z0-9_-]+$/.test(reasoningEffortRaw) && !['unsupported', 'unknown', 'default'].includes(reasoningEffortRaw) ? reasoningEffortRaw : '';
+    const speedMode = String(raw.speedMode || raw.serviceTier || '').trim().toLowerCase().slice(0, 60);
+    if (!reasoningEffort && !speedMode) continue;
+    normalized.push([agentId, {
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(speedMode ? { speedMode } : {}),
+    }]);
   }
   return Object.fromEntries(normalized);
 }
@@ -1149,12 +1149,23 @@ function normalizeModels(models) {
     profileName: String(model.profileName || '').trim().slice(0, 80),
     providerKey: String(model.providerKey || '').trim().slice(0, 120),
     apiMode: normalizeApiMode(model.apiMode),
+    modelsUrl: String(model.modelsUrl || '').trim().slice(0, 300),
+    modelApiModes: normalizeModelApiModes(model.modelApiModes),
+    compat: normalizeModelCompat(model.compat),
+    modelCompat: normalizeModelCompatMap(model.modelCompat),
     contextLimit: Number.isFinite(Number(model.contextLimit)) ? Number(model.contextLimit) : null,
+    capabilityMode: model.capabilityMode === 'manual' ? 'manual' : 'auto',
+    capabilityOverrides: normalizeCapabilityOverrides(model.capabilityOverrides),
     pricing: normalizeModelPricing(model.pricing),
   }));
   const usedKeys = new Map();
   const presets = loadProviderPresets();
   for (const model of normalized) {
+    if (comparableBaseUrl(model.baseUrl) === 'https://api.ikuncode.cc/v1') {
+      model.providerKey = 'ikuncode';
+      model.apiMode = 'codex_responses';
+      model.protocol = 'OpenAI Compatible';
+    }
     let providerKey = String(model.providerKey || '').trim();
     if (!providerKey && model.baseUrl) {
       const preset = presets.find((item) => comparableBaseUrl(item.baseUrl) === comparableBaseUrl(model.baseUrl));
@@ -1195,6 +1206,29 @@ function normalizeModelPricing(pricing = {}) {
   };
 }
 
+function normalizeModelApiModes(value) {
+  return Object.fromEntries(Object.entries(value && typeof value === 'object' ? value : {})
+    .map(([modelId, apiMode]) => [String(modelId || '').trim().slice(0, 100), normalizeApiMode(apiMode)])
+    .filter(([modelId, apiMode]) => modelId && apiMode));
+}
+
+function normalizeModelCompat(value = {}) {
+  const thinkingFormat = CHAT_THINKING_FORMATS.includes(value.thinkingFormat) ? value.thinkingFormat : 'openai';
+  const requestOverrides = {};
+  for (const [key, raw] of Object.entries(value.requestOverrides && typeof value.requestOverrides === 'object' ? value.requestOverrides : {})) {
+    const normalizedKey = String(key || '').trim().slice(0, 80);
+    if (!normalizedKey || /^(authorization|api[-_]?key|x-api-key|host|content-length|stream|stream_options|transfer-encoding|connection|proxy-authorization|x-forwarded-)/i.test(normalizedKey)) continue;
+    requestOverrides[normalizedKey] = raw;
+  }
+  return { thinkingFormat, requestOverrides };
+}
+
+function normalizeModelCompatMap(value) {
+  return Object.fromEntries(Object.entries(value && typeof value === 'object' ? value : {})
+    .map(([modelId, compat]) => [String(modelId || '').trim().slice(0, 100), normalizeModelCompat(compat)])
+    .filter(([modelId]) => modelId));
+}
+
 function publicModel(model) {
   return {
     id: model.id,
@@ -1210,7 +1244,13 @@ function publicModel(model) {
     profileName: model.profileName || '',
     providerKey: model.providerKey || '',
     apiMode: model.apiMode || '',
+    modelsUrl: model.modelsUrl || '',
+    modelApiModes: normalizeModelApiModes(model.modelApiModes),
+    compat: normalizeModelCompat(model.compat),
+    modelCompat: normalizeModelCompatMap(model.modelCompat),
     contextLimit: model.contextLimit || null,
+    capabilityMode: model.capabilityMode === 'manual' ? 'manual' : 'auto',
+    capabilityOverrides: model.capabilityMode === 'manual' ? normalizeCapabilityOverrides(model.capabilityOverrides) : {},
     pricing: normalizeModelPricing(model.pricing),
   };
 }
@@ -1835,13 +1875,13 @@ function normalizeMoaConfig(value, strict = false) {
 
 function modelProtocolFromApiMode(apiMode = '') {
   if (apiMode === 'anthropic_messages') return 'Anthropic Compatible';
-  if (apiMode === 'codex_responses' || apiMode === 'chat_completions') return 'OpenAI Compatible';
+  if (apiMode === 'openai_responses' || apiMode === 'codex_responses' || apiMode === 'chat_completions') return 'OpenAI Compatible';
   return apiMode ? 'Custom' : 'OpenAI Compatible';
 }
 
 function normalizeApiMode(value) {
   const clean = String(value || '').trim();
-  return ['chat_completions', 'codex_responses', 'anthropic_messages', 'bedrock_converse', 'codex_app_server'].includes(clean) ? clean : '';
+  return ['chat_completions', 'openai_responses', 'codex_responses', 'anthropic_messages', 'bedrock_converse', 'codex_app_server'].includes(clean) ? clean : '';
 }
 
 function providerPresetByKey(providerKey = '') {
@@ -1893,7 +1933,88 @@ async function saveCodexOAuthTokens(profileName, accessToken, refreshToken) {
   auth.credential_pool['openai-codex'] = [{ id: `openai-codex-${Date.now()}`, label: 'OpenAI Codex', base_url: providerPresetByKey('openai-codex')?.baseUrl || '', access_token: accessToken, last_status: null }];
   saveAuthJsonSync(authPath, auth);
   saveCodexCliTokens(accessToken, refreshToken);
-  await updateHermesModelProviderConfig(profileName, 'openai-codex', providerPresetByKey('openai-codex')?.models?.[0] || '');
+}
+
+function authEntryHasCredential(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(authEntryHasCredential);
+  return Boolean(
+    value.access_token || value.refresh_token || value.accessToken || value.refreshToken ||
+    value.agent_key || value.tokens?.access_token || value.tokens?.refresh_token
+  );
+}
+
+function oauthProviderAuthenticated(profileName, providerKey) {
+  const auth = loadAuthJsonSync(authJsonPathForProfile(profileName));
+  const aliases = providerKey === 'claude-oauth' ? ['claude-oauth', 'anthropic'] : [providerKey];
+  return aliases.some((key) => authEntryHasCredential(auth.providers?.[key]) || authEntryHasCredential(auth.credential_pool?.[key]));
+}
+
+function oauthProviderAccessToken(profileName, providerKey) {
+  const auth = loadAuthJsonSync(authJsonPathForProfile(profileName));
+  const aliases = providerKey === 'claude-oauth' ? ['claude-oauth', 'anthropic'] : [providerKey];
+  for (const key of aliases) {
+    const candidates = [auth.providers?.[key], ...(Array.isArray(auth.credential_pool?.[key]) ? auth.credential_pool[key] : [])];
+    for (const entry of candidates) {
+      const token = String(entry?.tokens?.access_token || entry?.access_token || entry?.accessToken || '').trim();
+      if (token) return token;
+    }
+  }
+  return '';
+}
+
+function oauthCatalogModel(providerKey) {
+  const preset = providerPresetByKey(providerKey) || {};
+  return { providerKey, apiMode: preset.apiMode || '', baseUrl: preset.baseUrl || '' };
+}
+
+function oauthProviderState(profileName, providerKey) {
+  const preset = providerPresetByKey(providerKey);
+  const authenticated = Boolean(preset?.authType && oauthProviderAuthenticated(profileName, providerKey));
+  const cached = catalogStatus(modelCatalogCache, oauthCatalogModel(providerKey));
+  if (!authenticated) {
+    return { authenticated: false, models: [], catalog: { ...cached, source: 'none', modelIds: [] } };
+  }
+  const cachedModels = cached.modelIds || [];
+  const models = cachedModels.length ? cachedModels : providerKey === 'openai-codex' ? [] : [...(preset?.models || [])];
+  return {
+    authenticated: true,
+    models,
+    catalog: {
+      ...cached,
+      source: cachedModels.length ? cached.source : providerKey === 'openai-codex' ? 'none' : 'frakio_builtin',
+      modelIds: models,
+      rich: cachedModels.length ? cached.rich : false,
+    },
+  };
+}
+
+function oauthProviderPayload(profileName, providerKey) {
+  const state = oauthProviderState(profileName, providerKey);
+  const preset = providerPresetByKey(providerKey) || {};
+  const capabilityModel = normalizeModels([{
+    id: 'oauth-catalog', name: preset.label || providerKey, provider: preset.label || providerKey,
+    providerKey, apiMode: preset.apiMode || '', baseUrl: preset.baseUrl || '',
+    model: state.models[0] || '', models: state.models, capabilityMode: 'auto', capabilityOverrides: {},
+  }])[0];
+  return {
+    ...state,
+    capabilities: Object.fromEntries(state.models.map((modelId) => [modelId, resolveModelCapability(capabilityModel, modelId, { providerCatalog: flattenProviderCatalog(modelCatalogCache) })])),
+  };
+}
+
+async function refreshCodexOAuthModels(accessToken) {
+  const provider = oauthCatalogModel('openai-codex');
+  try {
+    const normalized = await fetchCodexOAuthCatalog({ accessToken, endpoint: process.env.FRAKIO_WORK_CODEX_MODELS_URL || undefined });
+    const parsed = parseCatalogResponse(normalized, provider);
+    parsed.ids = normalized.models.map((model) => model.id);
+    await updateProviderCatalog(modelCatalogCachePath, modelCatalogCache, provider, parsed);
+    return catalogStatus(modelCatalogCache, provider);
+  } catch (error) {
+    await recordCatalogError(modelCatalogCachePath, modelCatalogCache, provider, error);
+    throw error;
+  }
 }
 
 async function saveClaudeOAuthTokens(profileName, tokenData) {
@@ -1912,7 +2033,6 @@ async function saveClaudeOAuthTokens(profileName, tokenData) {
   auth.providers = { ...(auth.providers || {}), 'claude-oauth': providerEntry, anthropic: providerEntry };
   auth.credential_pool = { ...(auth.credential_pool || {}), 'claude-oauth': [poolEntry], anthropic: [{ ...poolEntry, id: `anthropic-${Date.now()}`, label: 'Anthropic Claude OAuth' }] };
   saveAuthJsonSync(authPath, auth);
-  await updateHermesModelProviderConfig(profileName, 'claude-oauth', 'claude-sonnet-4-6');
 }
 
 async function saveGeminiOAuthTokens(profileName, tokenData, email = '') {
@@ -1931,7 +2051,6 @@ async function saveGeminiOAuthTokens(profileName, tokenData, email = '') {
   auth.credential_pool = auth.credential_pool || {};
   auth.credential_pool[geminiProviderKey] = [{ id: `${geminiProviderKey}-${Date.now()}`, label: 'Google Gemini OAuth', auth_type: 'oauth', source: 'loopback_pkce', priority: 0, access_token: accessToken, refresh_token: refreshToken, expires_at_ms: expiresAtMs, email, base_url: 'cloudcode-pa://google' }];
   saveAuthJsonSync(authPath, auth);
-  await updateHermesModelProviderConfig(profileName, geminiProviderKey, providerPresetByKey(geminiProviderKey)?.models?.[0] || 'gemini-3.1-pro-preview');
 }
 
 function readPlatformEnvAsConfig(envValues) {
@@ -2345,6 +2464,17 @@ async function writeGatewayAutoStartConfig(values = {}) {
   };
   await writeState(state);
   return next;
+}
+
+async function registerProfileGatewayAutoStart(profileName) {
+  const clean = slug(profileName || '');
+  const current = await readGatewayAutoStartConfig();
+  if (!clean || current.management !== 'per_profile') return current;
+  const include = current.include.length
+    ? Array.from(new Set([...current.include, clean]))
+    : ['default', clean];
+  const exclude = current.exclude.filter((name) => name !== clean);
+  return writeGatewayAutoStartConfig({ include, exclude });
 }
 
 function normalizeJob(job) {
@@ -2940,12 +3070,13 @@ function resetHermesAutoStartState(status = 'starting') {
     steps: [],
     logs: [],
     error: '',
+    warnings: [],
   };
 }
 
-function addHermesAutoStartStep(id, label, status, detail = '') {
+function addHermesAutoStartStep(id, label, status, detail = '', severity = 'standard') {
   const existingIndex = hermesAutoStartState.steps.findIndex((step) => step.id === id);
-  const step = { id, label, status, detail, updatedAt: now() };
+  const step = { ...runtimeStep(id, label, status, detail, severity), updatedAt: now() };
   if (existingIndex >= 0) hermesAutoStartState.steps[existingIndex] = { ...hermesAutoStartState.steps[existingIndex], ...step };
   else hermesAutoStartState.steps.push(step);
   if (detail) hermesAutoStartState.logs.push(`${label}: ${detail}`);
@@ -2966,24 +3097,24 @@ async function ensureHermesRuntimeReady({ force = false } = {}) {
   const run = (async () => {
     resetHermesAutoStartState('starting');
     try {
-      addHermesAutoStartStep('home', '初始化 Hermes Home', 'running');
+      addHermesAutoStartStep('home', '初始化 Hermes Home', 'running', '', 'core');
       await ensureHermesBaseConfig(hermesAutoStartState.logs);
-      addHermesAutoStartStep('home', '初始化 Hermes Home', 'ready', hermesHome);
+      addHermesAutoStartStep('home', '初始化 Hermes Home', 'ready', hermesHome, 'core');
 
       addHermesAutoStartStep('profiles', '读取本地 Hermes Profiles', 'running');
       const profiles = await readHermesProfiles();
       addHermesAutoStartStep('profiles', '读取本地 Hermes Profiles', profiles.length ? 'ready' : 'skipped', profiles.length ? `${profiles.length} profiles` : '未发现 profile');
 
-      addHermesAutoStartStep('bridge', '启动 Frakio Work Bridge', 'running');
+      addHermesAutoStartStep('bridge', '启动 Frakio Work Bridge', 'running', '', 'core');
       try {
         const startedBridge = await startHermesBridge();
         hermesAutoStartState.logs.push(...(startedBridge.logs || []));
-        addHermesAutoStartStep('bridge', '启动 Frakio Work Bridge', startedBridge.bridge?.ready ? 'ready' : 'failed', startedBridge.bridge?.endpoint || '');
+        addHermesAutoStartStep('bridge', '启动 Frakio Work Bridge', startedBridge.bridge?.ready ? 'ready' : 'failed', startedBridge.bridge?.endpoint || '', 'core');
       } catch (error) {
-        addHermesAutoStartStep('bridge', '启动 Frakio Work Bridge', 'failed', String(error?.message || error));
+        addHermesAutoStartStep('bridge', '启动 Frakio Work Bridge', 'failed', String(error?.message || error), 'core');
       }
 
-      addHermesAutoStartStep('api', '启动 Frakio Work Runtime API', 'running');
+      addHermesAutoStartStep('api', '启动外部兼容 API', 'running', '', 'optional');
       try {
         const apiLogs = [];
         const startedApi = await startHermesAgentApi(apiLogs);
@@ -2991,9 +3122,9 @@ async function ensureHermesRuntimeReady({ force = false } = {}) {
         const apiDetail = startedApi.api?.online
           ? startedApi.api?.apiBaseUrl
           : (startedApi.logs || apiLogs).slice(-8).join('\n') || startedApi.api?.apiBaseUrl || 'Runtime API 未启动';
-        addHermesAutoStartStep('api', '启动 Frakio Work Runtime API', startedApi.api?.online ? 'ready' : 'failed', apiDetail || 'http://127.0.0.1:8642/v1');
+        addHermesAutoStartStep('api', '启动外部兼容 API', startedApi.api?.online ? 'ready' : 'warning', apiDetail || 'http://127.0.0.1:8642/v1', 'optional');
       } catch (error) {
-        addHermesAutoStartStep('api', '启动 Frakio Work Runtime API', 'failed', String(error?.message || error));
+        addHermesAutoStartStep('api', '启动外部兼容 API', 'warning', String(error?.message || error), 'optional');
       }
 
       addHermesAutoStartStep('gateways', '启动 Profile Gateway', 'running');
@@ -3016,9 +3147,10 @@ async function ensureHermesRuntimeReady({ force = false } = {}) {
         addHermesAutoStartStep('gateways', '启动 Profile Gateway', 'failed', String(error?.message || error));
       }
 
-      const failedSteps = hermesAutoStartState.steps.filter((step) => step.status === 'failed');
-      hermesAutoStartState.status = failedSteps.length ? 'partial' : 'ready';
-      hermesAutoStartState.error = failedSteps.map((step) => `${step.label}: ${step.detail}`).join('\n');
+      const summary = summarizeRuntimeAutoStart(hermesAutoStartState.steps);
+      hermesAutoStartState.status = summary.status;
+      hermesAutoStartState.error = summary.error;
+      hermesAutoStartState.warnings = summary.warnings;
       hermesAutoStartState.finishedAt = now();
       return hermesAutoStartState;
     } catch (error) {
@@ -3568,6 +3700,10 @@ async function syncHermesProfilesToState(state, discovery = null) {
     else state.agents.push(nextAgent);
 
     importedProfileNames.add(profile.name);
+  }
+
+  if (!state.agents.some((agent) => agent.id === state.ui?.defaultAgentId)) {
+    state.ui = { ...(state.ui || {}), defaultAgentId: resolveDefaultAgentId(state) };
   }
 
   state.integrations.hermesAgent = {
@@ -4212,7 +4348,7 @@ async function readHermesAgentUsageRows() {
 
 function agentFromProfile(profile, existing = null) {
   const idValue = profile.name === 'default' ? 'hermes-default' : slug(profile.name);
-  const modelName = existing?.model || '未绑定 Demo 模型';
+  const modelName = existing?.model || '';
   const providerName = profile.providers?.[0]?.providerName || providerLabel(profile.provider);
   const soul = profileTextOrExisting(profile.soul || profile.soulExcerpt, existing?.soul);
   const userProfile = String(profile.userProfile || '').trim() || String(existing?.userProfile || '').trim();
@@ -4925,20 +5061,17 @@ async function createHermesProfileFiles(profileName, payload) {
   await mkdir(path.join(dir, 'memories'), { recursive: true });
   await mkdir(path.join(dir, 'skills'), { recursive: true });
   const displayName = String(payload.name || titleCaseProfile(profileName)).trim();
-  const model = String(payload.model || 'gpt-5.5').trim();
+  const model = String(payload.model || '').trim();
   const role = String(payload.role || '新 Agent').trim();
   const soul = String(payload.soul || `# SOUL.md — ${displayName}\n\n## 基础身份\n你叫 ${displayName}。\n\n## 角色定位\n${role}\n`).trim();
   const userProfile = String(payload.userProfile || '').trim();
   const memory = String(payload.memory || '').trim();
   const config = {
-    model: {
-      provider: 'custom',
-      default: model,
-    },
     providers: {},
     skills: { disabled: [] },
     plugins: { enabled: [], disabled: [] },
   };
+  if (model) config.model = { provider: 'custom', default: model };
   await writeFile(path.join(dir, 'profile.yaml'), YAML.stringify({ name: displayName, display_name: displayName, role }), 'utf8');
   await writeFile(path.join(dir, 'config.yaml'), YAML.stringify(config), 'utf8');
   await writeFile(path.join(dir, 'SOUL.md'), `${soul}\n`, 'utf8');
@@ -4996,8 +5129,8 @@ async function ensureModelProviderForProfile(profileName, rawModel, requestedMod
   const storageKey = providerConfigStorageKey(selectedModel.providerKey);
   const reusableApiKey = selectedModel.id ? await getReusableModelSecret(selectedModel, models) : '';
   const preset = !String(selectedModel.providerKey).startsWith('custom:') ? providerPresetByKey(selectedModel.providerKey) : null;
-  if (preset) {
-    const envMapping = providerEnvMap[selectedModel.providerKey] || {};
+  const envMapping = providerEnvMap[selectedModel.providerKey] || {};
+  if (preset && (Object.keys(envMapping).length || oauthProviderKeys.has(selectedModel.providerKey))) {
     const envPath = profileEnvPath(profileName);
     const currentEnv = await readEnvValues(envPath);
     const apiKey = reusableApiKey
@@ -5034,6 +5167,7 @@ async function ensureModelProviderForProfile(profileName, rawModel, requestedMod
         base_url: selectedModel.baseUrl,
         ...(reusableApiKey ? { api_key: reusableApiKey } : {}),
         model: modelName,
+        api_mode: selectedModel.modelApiModes?.[modelName] || selectedModel.apiMode || 'chat_completions',
       }
     : existingProvider;
   const nextConfig = {
@@ -5163,6 +5297,112 @@ async function runPresetProviderCredentialMigration() {
     backupDir: plans.length ? backupDir : '',
     profiles: plans.map((plan) => ({ profileName: plan.profileName, provider: plan.provider, model: plan.modelName, hasApiKey: true })),
     skipped,
+  }, null, 2)}\n`, 'utf8');
+}
+
+function matchesLegacyFields(value, legacy, keys) {
+  if (!value || !legacy) return false;
+  return keys.every((key) => JSON.stringify(value[key] ?? null) === JSON.stringify(legacy[key] ?? null));
+}
+
+function isUntouchedLegacyAgent(agent) {
+  const legacy = legacyDemoAgents.find((item) => item.id === agent?.id);
+  if (!legacy || !matchesLegacyFields(agent, legacy, ['id', 'name', 'role', 'model', 'color', 'soul', 'scope', 'source'])) return false;
+  return !String(agent.profileName || '').trim()
+    && !String(agent.userProfile || '').trim()
+    && !String(agent.memory || '').trim()
+    && !String(agent.avatarUrl || '').trim()
+    && !(agent.skills || []).length
+    && !(agent.plugins || []).length;
+}
+
+function isUntouchedLegacyModel(model) {
+  const legacy = legacyDefaultModels.find((item) => item.id === model?.id);
+  return Boolean(legacy && matchesLegacyFields(model, legacy, ['id', 'name', 'provider', 'kind', 'protocol', 'model', 'models', 'baseUrl', 'source', 'pricing']));
+}
+
+function isUntouchedLegacyWelcomeThread(thread) {
+  if (thread?.id !== 'thread_default' || thread?.title !== '欢迎使用 Frakio Work') return false;
+  if (JSON.stringify(thread.messages || []) !== JSON.stringify(legacyWelcomeMessages)) return false;
+  return thread.workspaceId === 'workspace_default'
+    && thread.mode === 'workspace'
+    && thread.primaryAgentId === 'iris'
+    && thread.defaultAgentId === 'iris'
+    && JSON.stringify(thread.selectedAgents || []) === JSON.stringify(['iris', 'max']);
+}
+
+function isUntouchedLegacyVault(vault) {
+  return vault?.id === 'vault_creative_ai_team'
+    && vault?.name === '示例知识库'
+    && vault?.status === 'not_indexed'
+    && Number(vault?.documentCount || 0) === 0
+    && Number(vault?.productCount || 0) === 0
+    && !vault?.lastIndexedAt
+    && !vault?.index;
+}
+
+function modelIsReferenced(state, model, remainingAgents, remainingThreads, secrets) {
+  const names = new Set([model.id, model.name, model.model].filter(Boolean));
+  if (remainingAgents.some((agent) => names.has(agent.model))) return true;
+  if (remainingThreads.some((thread) => Object.values(thread.agentModelOverrides || {}).some((value) => names.has(String(value || '').split('::')[0]) || names.has(String(value || '').split('::')[1])))) return true;
+  if (String(secrets.models?.[model.id]?.apiKey || '').trim()) return true;
+  return (state.observability?.modelUsage || []).some((usage) => names.has(usage?.modelId) || names.has(usage?.model) || names.has(usage?.modelName));
+}
+
+async function runLegacyDemoDataCleanupMigration() {
+  const migrationRoot = path.join(frakioWorkHome, 'backups', 'demo-data-cleanup');
+  const markerPath = path.join(migrationRoot, 'v1-complete.json');
+  if (await exists(markerPath)) return;
+  const raw = JSON.parse(await readFile(statePath, 'utf8').catch(() => 'null'));
+  if (!raw) return;
+  const secrets = await readSecrets();
+  const removedAgents = (raw.agents || []).filter(isUntouchedLegacyAgent);
+  const remainingAgents = (raw.agents || []).filter((agent) => !removedAgents.includes(agent));
+  const removedThreads = (raw.threads || []).filter(isUntouchedLegacyWelcomeThread);
+  const remainingThreads = (raw.threads || []).filter((thread) => !removedThreads.includes(thread));
+  const removedVaults = (raw.vaults || []).filter((vault) => isUntouchedLegacyVault(vault) && !remainingThreads.some((thread) => thread.vaultId === vault.id));
+  const remainingVaults = (raw.vaults || []).filter((vault) => !removedVaults.includes(vault));
+  const removedModels = (raw.models || []).filter((model) => isUntouchedLegacyModel(model) && !modelIsReferenced(raw, model, remainingAgents, remainingThreads, secrets));
+  const remainingModels = (raw.models || []).filter((model) => !removedModels.includes(model));
+  const removedAgentIds = new Set(removedAgents.map((agent) => agent.id));
+  const removedThreadIds = new Set(removedThreads.map((thread) => thread.id));
+  const removedVaultIds = new Set(removedVaults.map((vault) => vault.id));
+  const removedModelIds = new Set(removedModels.map((model) => model.id));
+  const next = {
+    ...raw,
+    agents: remainingAgents,
+    models: remainingModels,
+    threads: remainingThreads,
+    vaults: remainingVaults,
+    defaultVaultId: removedVaultIds.has(raw.defaultVaultId) ? null : raw.defaultVaultId || null,
+    ui: {
+      ...(raw.ui || {}),
+      defaultAgentId: removedAgentIds.has(raw.ui?.defaultAgentId) ? '' : raw.ui?.defaultAgentId || '',
+      defaultModel: removedModelIds.has(raw.ui?.defaultModel) ? '' : raw.ui?.defaultModel || '',
+    },
+    workspaces: (raw.workspaces || []).map((workspace) => ({
+      ...workspace,
+      activeThreadId: removedThreadIds.has(workspace.activeThreadId) ? null : workspace.activeThreadId || null,
+      vaultId: removedVaultIds.has(workspace.vaultId) ? null : workspace.vaultId || null,
+    })),
+  };
+  const changed = removedAgents.length || removedModels.length || removedThreads.length || removedVaults.length;
+  let backupPath = '';
+  if (changed) {
+    await mkdir(migrationRoot, { recursive: true });
+    backupPath = path.join(migrationRoot, `workbench-state-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+    await cp(statePath, backupPath);
+    await writeFile(statePath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  }
+  await mkdir(migrationRoot, { recursive: true });
+  await writeFile(markerPath, `${JSON.stringify({
+    version: 1,
+    completedAt: now(),
+    backupPath,
+    removedAgentIds: [...removedAgentIds],
+    removedModelIds: [...removedModelIds],
+    removedThreadIds: [...removedThreadIds],
+    removedVaultIds: [...removedVaultIds],
   }, null, 2)}\n`, 'utf8');
 }
 
@@ -7275,74 +7515,95 @@ app.get('/api/models', async (_req, res) => {
   res.json({ models: state.models.map(publicModel) });
 });
 
-app.get('/api/model-providers/presets', (_req, res) => {
-  res.json({ providers: loadProviderPresets() });
+app.get('/api/model-capabilities', async (_req, res) => {
+  const state = await readState();
+  const providerCatalog = flattenProviderCatalog(modelCatalogCache);
+  res.json({
+    runtimeVersion: '0.18.2',
+    capabilities: capabilitiesForModels(state.models, { providerCatalog }),
+    providers: Object.fromEntries(state.models.map((model) => [model.id, catalogStatus(modelCatalogCache, model)])),
+  });
 });
 
-function providerModelsUrl(baseUrl) {
-  const clean = String(baseUrl || '').trim().replace(/\/+$/, '');
-  if (!clean) {
-    const error = new Error('Base URL 不能为空。');
-    error.status = 400;
-    throw error;
-  }
-  let parsed;
-  try {
-    parsed = new URL(clean);
-  } catch {
-    const error = new Error('Base URL 格式不正确。');
-    error.status = 400;
-    throw error;
-  }
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
-    const error = new Error('Base URL 必须是 http 或 https。');
-    error.status = 400;
-    throw error;
-  }
-  parsed.pathname = parsed.pathname
-    .replace(/\/chat\/completions\/?$/i, '')
-    .replace(/\/responses\/?$/i, '')
-    .replace(/\/models\/?$/i, '');
-  const normalized = parsed.toString().replace(/\/+$/, '');
-  return /\/v\d+$/i.test(parsed.pathname) ? `${normalized}/models` : `${normalized}/v1/models`;
-}
-
-function parseModelIds(body) {
-  const rows = Array.isArray(body?.data) ? body.data : Array.isArray(body?.models) ? body.models : [];
-  return Array.from(new Set(rows.map((item) => String(item?.id || item?.name || item || '').trim()).filter(Boolean))).sort();
-}
+app.get('/api/model-providers/presets', async (req, res) => {
+  const profile = await requestedModelProfile(req);
+  const providers = loadProviderPresets().filter((preset) => preset.selectable).map((preset) => {
+    const { selectable: _selectable, ...publicPreset } = preset;
+    if (!preset.authType) return { ...publicPreset, authenticated: false };
+    const state = oauthProviderState(profile, preset.value);
+    return { ...publicPreset, models: state.models, authenticated: state.authenticated, catalog: state.catalog };
+  });
+  res.json({ profile, providers });
+});
 
 async function fetchProviderModelsForRequest(body) {
   const apiKey = String(body?.apiKey || body?.api_key || '').trim();
-  const url = providerModelsUrl(body?.baseUrl || body?.base_url);
-  const result = await fetchJson(url, {
-    method: 'GET',
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-    timeoutMs: 9000,
-  });
-  if (!result.ok) {
-    const providerMessage = typeof result.body?.error?.message === 'string' ? `：${result.body.error.message.slice(0, 180)}` : '';
-    const error = new Error(result.status === 401 || result.status === 403
-      ? `API Key 未授权，或供应商拒绝访问模型列表${providerMessage}。`
-      : `模型列表获取失败，HTTP ${result.status || 'network'}${providerMessage}。`);
-    error.status = result.status || 502;
-    throw error;
+  const provider = {
+    providerKey: String(body?.providerKey || '').trim(), apiMode: normalizeApiMode(body?.apiMode),
+    baseUrl: String(body?.baseUrl || body?.base_url || '').trim(), modelsUrl: String(body?.modelsUrl || '').trim(),
+  };
+  const urls = candidateModelUrls(provider);
+  if (!urls.length) throw Object.assign(new Error('Base URL 格式不正确。'), { status: 400 });
+  let lastError = null;
+  for (const url of urls) {
+    const result = await fetchJson(url, { method: 'GET', headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}, timeoutMs: 9000 });
+    if (!result.ok) {
+      const providerMessage = typeof result.body?.error?.message === 'string' ? `：${result.body.error.message.slice(0, 180)}` : '';
+      lastError = Object.assign(new Error(result.status === 401 || result.status === 403
+        ? `API Key 未授权，或供应商拒绝访问模型列表${providerMessage}。`
+        : `模型列表获取失败，HTTP ${result.status || 'network'}${providerMessage}。`), { status: result.status || 502 });
+      if ([401, 403].includes(result.status)) break;
+      continue;
+    }
+    const parsed = parseCatalogResponse(result.body, provider);
+    if (!parsed.ids.length) {
+      lastError = Object.assign(new Error('供应商返回了响应，但没有识别到模型 ID。'), { status: 502 });
+      continue;
+    }
+    await updateProviderCatalog(modelCatalogCachePath, modelCatalogCache, provider, parsed);
+    return { models: parsed.ids, records: parsed.records, rich: parsed.rich, provider, url };
   }
-  const models = parseModelIds(result.body);
-  if (!models.length) {
-    const error = new Error('供应商返回了响应，但没有识别到模型 ID。');
-    error.status = 502;
-    throw error;
+  await recordCatalogError(modelCatalogCachePath, modelCatalogCache, provider, lastError || '模型目录不可用。');
+  throw lastError || Object.assign(new Error('模型列表获取失败。'), { status: 502 });
+}
+
+async function refreshStaleProviderCatalogs() {
+  const state = await readState();
+  const seen = new Set();
+  for (const model of state.models) {
+    const signature = `${model.providerKey}|${model.apiMode}|${comparableBaseUrl(model.baseUrl)}`;
+    if (seen.has(signature) || !model.baseUrl || !catalogStatus(modelCatalogCache, model).stale) continue;
+    seen.add(signature);
+    const apiKey = await getReusableModelSecret(model, state.models);
+    const local = /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/)/i.test(model.baseUrl);
+    if (!apiKey && !local) continue;
+    await fetchProviderModelsForRequest({ ...model, apiKey }).catch(() => {});
   }
-  return models;
 }
 
 app.post('/api/models/fetch', async (req, res) => {
   try {
-    const models = await fetchProviderModelsForRequest(req.body);
+    const fetched = await fetchProviderModelsForRequest(req.body);
+    const models = fetched.models;
+    const capabilityModel = normalizeModels([{
+      id: 'fetched',
+      name: req.body?.provider || req.body?.providerKey || 'Provider',
+      provider: req.body?.provider || 'Custom',
+      providerKey: req.body?.providerKey || '',
+      apiMode: req.body?.apiMode || '',
+      baseUrl: req.body?.baseUrl || '',
+      model: models[0],
+      models,
+      capabilityMode: req.body?.capabilityMode,
+      capabilityOverrides: req.body?.capabilityOverrides,
+    }])[0];
     captureTelemetry('feature_used', { feature: 'model_connected', outcome: 'completed' });
     captureMeaningfulActivity('feature_used');
-    res.json({ models });
+    res.json({
+      models,
+      capabilities: Object.fromEntries(models.map((modelName) => [modelName, resolveModelCapability(capabilityModel, modelName, { providerCatalog: flattenProviderCatalog(modelCatalogCache) })])),
+      catalog: { source: fetched.rich ? 'provider_catalog' : 'model_ids', rich: fetched.rich, url: fetched.url, ...catalogStatus(modelCatalogCache, fetched.provider) },
+    });
   } catch (error) {
     res.status(error.status || 500).json({ error: error.message || '模型列表获取失败。' });
   }
@@ -7350,12 +7611,101 @@ app.post('/api/models/fetch', async (req, res) => {
 
 app.post('/api/model-providers/fetch', async (req, res) => {
   try {
-    const models = await fetchProviderModelsForRequest(req.body);
+    const fetched = await fetchProviderModelsForRequest(req.body);
+    const models = fetched.models;
     captureTelemetry('feature_used', { feature: 'model_connected', outcome: 'completed' });
     captureMeaningfulActivity('feature_used');
-    res.json({ models });
+    res.json({ models, catalog: { source: fetched.rich ? 'provider_catalog' : 'model_ids', rich: fetched.rich, url: fetched.url, ...catalogStatus(modelCatalogCache, fetched.provider) } });
   } catch (error) {
     res.status(error.status || 500).json({ error: error.message || '模型列表获取失败。' });
+  }
+});
+
+function providerInferenceUrl(model) {
+  const base = String(model.baseUrl || '').trim().replace(/\/+$/, '').replace(/\/(chat\/completions|responses|messages)$/i, '');
+  if (model.apiMode === 'anthropic_messages') return /\/v1$/i.test(base) ? `${base}/messages` : `${base}/v1/messages`;
+  if (model.apiMode === 'codex_responses' || model.apiMode === 'openai_responses') return /\/v1$/i.test(base) ? `${base}/responses` : `${base}/v1/responses`;
+  return /\/v1$/i.test(base) ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+}
+
+app.post('/api/models/:id/verify', async (req, res) => {
+  let verificationContext = null;
+  try {
+    const state = await readState();
+    const model = state.models.find((item) => item.id === req.params.id);
+    if (!model) return res.status(404).json({ error: '模型不存在。' });
+    const modelId = String(req.body?.modelId || model.model || '').trim();
+    verificationContext = { model, modelId };
+    const capability = resolveModelCapability(model, modelId, { providerCatalog: flattenProviderCatalog(modelCatalogCache) });
+    const apiKey = String(req.body?.apiKey || '').trim() || await getReusableModelSecret(model, state.models);
+    if (!apiKey && !oauthProviderKeys.has(model.providerKey)) return res.status(400).json({ error: '验证需要可用的 API Key。' });
+    const headers = model.apiMode === 'anthropic_messages'
+      ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }
+      : { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+    const mode = req.body?.mode === 'discover' ? 'discover' : 'connection';
+    const canDiscover = model.capabilityMode !== 'manual'
+      && String(model.providerKey || '').startsWith('custom:')
+      && (model.apiMode === 'codex_responses' || model.apiMode === 'openai_responses')
+      && ['unknown', 'verification_failed'].includes(capability.status);
+    if (mode === 'discover' && !canDiscover) {
+      return res.status(400).json({ error: '当前 Provider 不适合自动探测；请使用现有目录能力或手动能力设置。' });
+    }
+
+    if (mode === 'discover') {
+      const discovery = await probeResponsesCapabilities({
+        modelId,
+        request: async (body) => {
+          try {
+            return await fetchExternalJson(providerInferenceUrl(model), { method: 'POST', headers, body: JSON.stringify(body), timeoutMs: 12000 });
+          } catch (error) {
+            return { ok: false, status: 0, error: String(error?.name === 'AbortError' ? '请求超时' : error?.message || error) };
+          }
+        },
+      });
+      await recordActiveProbeCapability(modelCatalogCachePath, modelCatalogCache, model, discovery.capability);
+      modelCatalogCache.verifications = modelCatalogCache.verifications || {};
+      modelCatalogCache.verifications[verificationKey(model, modelId)] = {
+        status: 'confirmed', modelId, verifiedAt: discovery.verifiedAt,
+        reasoning: discovery.capability.defaultReasoning || 'default',
+        serviceTier: discovery.capability.serviceTiers[0]?.id || 'standard',
+        probeResults: discovery.probeResults,
+      };
+      await writeCatalogCache(modelCatalogCachePath, modelCatalogCache);
+      return res.json({
+        verified: true, mode, modelId,
+        requestedReasoning: 'discover', effectiveReasoning: discovery.capability.defaultReasoning || 'default',
+        requestedServiceTier: 'discover', effectiveServiceTier: discovery.capability.serviceTiers[0]?.id || 'standard',
+        capabilitySource: discovery.capability.source,
+        capability: discovery.capability,
+        probeResults: discovery.probeResults,
+        verifiedAt: discovery.verifiedAt,
+      });
+    }
+
+    const mapped = mapRunSettings(model, capability, { reasoningEffort: req.body?.reasoningEffort, serviceTier: req.body?.serviceTier || req.body?.speedMode });
+    const requestOverrides = mapped.runtimeOverrides.request_overrides || {};
+    let body;
+    if (model.apiMode === 'anthropic_messages') body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...requestOverrides };
+    else if (model.apiMode === 'codex_responses' || model.apiMode === 'openai_responses') body = { model: modelId, input: 'Reply OK.', max_output_tokens: 8, ...(mapped.runtimeOverrides.reasoning_config ? { reasoning: mapped.runtimeOverrides.reasoning_config } : {}), ...(mapped.runtimeOverrides.service_tier ? { service_tier: mapped.runtimeOverrides.service_tier } : {}), ...requestOverrides };
+    else body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...requestOverrides };
+    const result = await fetchExternalJson(providerInferenceUrl(model), { method: 'POST', headers, body: JSON.stringify(body), timeoutMs: 30000 });
+    if (!result.ok) {
+      const message = String(result.body?.error?.message || `HTTP ${result.status}`).slice(0, 500);
+      throw Object.assign(new Error(`配置验证失败：${message}`), { status: result.status || 502 });
+    }
+    modelCatalogCache.verifications = modelCatalogCache.verifications || {};
+    const key = verificationKey(model, modelId);
+    const verifiedAt = now();
+    modelCatalogCache.verifications[key] = { status: 'confirmed', modelId, verifiedAt, reasoning: mapped.effectiveReasoning, serviceTier: mapped.effectiveServiceTier };
+    await writeCatalogCache(modelCatalogCachePath, modelCatalogCache);
+    res.json({ verified: true, mode, modelId, requestedReasoning: mapped.requestedReasoning, effectiveReasoning: mapped.effectiveReasoning, requestedServiceTier: mapped.requestedServiceTier, effectiveServiceTier: mapped.effectiveServiceTier, capabilitySource: capability.source, capability, probeResults: [], verifiedAt });
+  } catch (error) {
+    if (verificationContext) {
+      modelCatalogCache.verifications = modelCatalogCache.verifications || {};
+      modelCatalogCache.verifications[verificationKey(verificationContext.model, verificationContext.modelId)] = { status: 'verification_failed', modelId: verificationContext.modelId, verifiedAt: now(), error: String(error.message || error).slice(0, 500) };
+      await writeCatalogCache(modelCatalogCachePath, modelCatalogCache).catch(() => {});
+    }
+    res.status(error.status || 500).json({ error: error.message || '配置验证失败。' });
   }
 });
 
@@ -7419,6 +7769,13 @@ async function codexLoginWorker(session) {
       }
       const tokenData = await tokenRes.json();
       await saveCodexOAuthTokens(session.profile, tokenData.access_token, tokenData.refresh_token || '');
+      try {
+        await refreshCodexOAuthModels(tokenData.access_token);
+      } catch {}
+      const providerState = oauthProviderPayload(session.profile, 'openai-codex');
+      session.models = providerState.models;
+      session.catalog = providerState.catalog;
+      session.capabilities = providerState.capabilities;
       session.status = 'approved';
       return;
     } catch (error) {
@@ -7464,7 +7821,21 @@ app.post('/api/auth/codex/start', async (req, res) => {
 app.get('/api/auth/codex/:sessionId', (req, res) => {
   const session = codexAuthSessions.get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: '授权会话不存在。' });
-  res.json({ status: session.status, error: session.error || null });
+  res.json({ status: session.status, error: session.error || null, authenticated: session.status === 'approved', models: session.models || [], catalog: session.catalog || null, capabilities: session.capabilities || {} });
+});
+
+app.post('/api/auth/codex/catalog', async (req, res) => {
+  const profile = await requestedModelProfile(req);
+  const accessToken = oauthProviderAccessToken(profile, 'openai-codex');
+  if (!accessToken) return res.status(401).json({ error: '请先完成 OpenAI Codex 授权。', authenticated: false, models: [] });
+  try {
+    await refreshCodexOAuthModels(accessToken);
+    const state = oauthProviderPayload(profile, 'openai-codex');
+    res.json(state);
+  } catch (error) {
+    const state = oauthProviderPayload(profile, 'openai-codex');
+    res.status(state.models.length ? 200 : 502).json({ ...state, error: error.message || 'Codex 模型目录获取失败。' });
+  }
 });
 
 app.post('/api/auth/claude/start', async (req, res) => {
@@ -7525,7 +7896,8 @@ app.post('/api/auth/claude/:sessionId/submit', async (req, res) => {
     }
     await saveClaudeOAuthTokens(session.profile, await response.json());
     session.status = 'approved';
-    res.json({ status: session.status, error: null });
+    const providerState = oauthProviderPayload(session.profile, 'claude-oauth');
+    res.json({ status: session.status, error: null, ...providerState });
   } catch (error) {
     session.status = 'error';
     session.error = error.message || String(error);
@@ -7644,7 +8016,8 @@ app.get('/api/auth/gemini/:sessionId', (req, res) => {
     session.status = 'expired';
     try { session.server?.close(); } catch {}
   }
-  res.json({ status: session.status, error: session.error || null });
+  const providerState = session.status === 'approved' ? oauthProviderPayload(session.profile, geminiProviderKey) : null;
+  res.json({ status: session.status, error: session.error || null, ...(providerState || {}) });
 });
 
 app.post('/api/models', async (req, res) => {
@@ -7653,7 +8026,11 @@ app.post('/api/models', async (req, res) => {
   if (!name) return res.status(400).json({ error: '模型名称不能为空。' });
   const providerKey = String(req.body?.providerKey || '').trim().slice(0, 120);
   const apiMode = normalizeApiMode(req.body?.apiMode);
-  const hasCredential = String(req.body?.apiKey || '').trim() || oauthProviderKeys.has(providerKey);
+  if (providerKey.startsWith('custom:') && !apiMode) return res.status(400).json({ error: '自定义 Provider 必须选择 API 协议。' });
+  const profileName = await requestedModelProfile(req);
+  const oauthAuthenticated = oauthProviderKeys.has(providerKey) && oauthProviderAuthenticated(profileName, providerKey);
+  if (oauthProviderKeys.has(providerKey) && !oauthAuthenticated) return res.status(400).json({ error: '请先完成 Provider 授权。' });
+  const hasCredential = String(req.body?.apiKey || '').trim() || oauthAuthenticated;
   const modelNames = normalizeModelNames(req.body?.models, req.body?.model);
   if (!modelNames.length) return res.status(400).json({ error: '请先获取或填写至少一个模型。' });
   const defaultModel = modelNames.includes(String(req.body?.model || '').trim()) ? String(req.body.model).trim() : modelNames[0];
@@ -7669,16 +8046,23 @@ app.post('/api/models', async (req, res) => {
     apiKey: '',
     apiKeyState: hasCredential ? (oauthProviderKeys.has(providerKey) ? 'authorized' : 'provided') : '',
     source: 'manual',
-    profileName: '',
+    profileName: oauthProviderKeys.has(providerKey) ? profileName : '',
     providerKey,
     apiMode,
+    modelsUrl: String(req.body?.modelsUrl || '').trim().slice(0, 300),
+    modelApiModes: normalizeModelApiModes(req.body?.modelApiModes),
+    compat: normalizeModelCompat(req.body?.compat),
+    modelCompat: normalizeModelCompatMap(req.body?.modelCompat),
     contextLimit: Number.isFinite(Number(req.body?.contextLimit)) && Number(req.body.contextLimit) > 0 ? Number(req.body.contextLimit) : null,
+    capabilityMode: req.body?.capabilityMode === 'manual' ? 'manual' : 'auto',
+    capabilityOverrides: normalizeCapabilityOverrides(req.body?.capabilityOverrides),
     pricing: normalizeModelPricing(req.body?.pricing),
   };
   model.providerKey = normalizeModels([...state.models, model]).find((item) => item.id === model.id)?.providerKey || providerKey;
   state.models.push(model);
   await setModelSecret(model.id, req.body?.apiKey);
   await writeState(state);
+  if (oauthProviderKeys.has(providerKey)) await updateHermesModelProviderConfig(profileName, providerKey, defaultModel);
   res.json({ model: publicModel(model), models: state.models.map(publicModel) });
 });
 
@@ -7719,7 +8103,13 @@ app.patch('/api/models/:id', async (req, res) => {
     model.apiMode = normalizeApiMode(req.body.apiMode);
     if (!('protocol' in req.body)) model.protocol = modelProtocolFromApiMode(model.apiMode);
   }
+  if ('modelsUrl' in req.body) model.modelsUrl = String(req.body.modelsUrl || '').trim().slice(0, 300);
+  if ('modelApiModes' in req.body) model.modelApiModes = normalizeModelApiModes(req.body.modelApiModes);
+  if ('compat' in req.body) model.compat = normalizeModelCompat(req.body.compat);
+  if ('modelCompat' in req.body) model.modelCompat = normalizeModelCompatMap(req.body.modelCompat);
   if ('contextLimit' in req.body) model.contextLimit = Number.isFinite(Number(req.body.contextLimit)) && Number(req.body.contextLimit) > 0 ? Number(req.body.contextLimit) : null;
+  if ('capabilityMode' in req.body) model.capabilityMode = req.body.capabilityMode === 'manual' ? 'manual' : 'auto';
+  if ('capabilityOverrides' in req.body) model.capabilityOverrides = normalizeCapabilityOverrides(req.body.capabilityOverrides);
   if ('pricing' in req.body) model.pricing = normalizeModelPricing(req.body.pricing);
   if (oauthProviderKeys.has(model.providerKey)) model.apiKeyState = 'authorized';
   if (String(req.body?.apiKey || '').trim()) {
@@ -7729,12 +8119,26 @@ app.patch('/api/models/:id', async (req, res) => {
   model.providerKey = normalizeModels(state.models).find((item) => item.id === model.id)?.providerKey || model.providerKey;
   model.apiKey = '';
   await writeState(state);
+  if (oauthProviderKeys.has(model.providerKey) && model.model) {
+    await updateHermesModelProviderConfig(model.profileName || await requestedModelProfile(req), model.providerKey, model.model);
+  }
+  modelCatalogCache.verifications = {};
+  await writeCatalogCache(modelCatalogCachePath, modelCatalogCache).catch(() => {});
   res.json({ model: publicModel(model), models: state.models.map(publicModel) });
 });
 
 app.post('/api/agents', async (req, res) => {
   try {
     const state = await readState();
+    const requestId = String(req.body?.requestId || '').trim().slice(0, 120);
+    const previousAgentId = requestId ? state.integrations?.hermesAgent?.agentCreationRequests?.[requestId]?.agentId : '';
+    const previousAgent = previousAgentId ? state.agents.find((item) => item.id === previousAgentId) : null;
+    if (previousAgent) {
+      const runtime = await hermesRuntimeStatus().catch(() => null);
+      const profileName = previousAgent.profileName || previousAgent.id;
+      const gateway = runtime?.gateways?.find((item) => item.profileName === profileName) || null;
+      return res.json({ agent: previousAgent, agents: state.agents, gateway, runtime, idempotentReplay: true });
+    }
     const name = String(req.body?.name || '').trim();
     if (!name) return res.status(400).json({ error: 'Agent 名称不能为空。' });
     const profileName = await uniqueProfileName(name);
@@ -7744,7 +8148,7 @@ app.post('/api/agents', async (req, res) => {
       id: profileName,
       name: name.slice(0, 32),
       role: String(req.body?.role || '新 Agent').trim().slice(0, 60),
-      model: String(req.body?.model || profile?.model || 'gpt-5.5').trim().slice(0, 60),
+      model: String(req.body?.model || '').trim().slice(0, 60),
       color: String(req.body?.color || profileColor(profileName)).trim().slice(0, 20),
       soul: profile?.soul || String(req.body?.soul || req.body?.scope || '待定义 Soul。').trim(),
       scope: String(req.body?.scope || req.body?.role || '待定义职责范围。').trim().slice(0, 300),
@@ -7761,9 +8165,34 @@ app.post('/api/agents', async (req, res) => {
       plugins: profile?.plugins || [],
       avatarUrl: profile?.avatarUrl || '',
     };
+    const firstAgent = state.agents.length === 0;
     state.agents.push(agent);
+    if (firstAgent || !state.agents.some((item) => item.id === state.ui?.defaultAgentId)) {
+      state.ui = { ...(state.ui || {}), defaultAgentId: agent.id };
+    }
+    if (requestId) {
+      const previousRequests = Object.entries(state.integrations?.hermesAgent?.agentCreationRequests || {}).slice(-99);
+      state.integrations.hermesAgent = {
+        ...(state.integrations.hermesAgent || {}),
+        agentCreationRequests: Object.fromEntries([...previousRequests, [requestId, { agentId: agent.id, createdAt: now() }]]),
+      };
+    }
     await writeState(state);
-    res.json({ agent, agents: state.agents, profile });
+    const warnings = [];
+    try {
+      await registerProfileGatewayAutoStart(profileName);
+    } catch (error) {
+      warnings.push(`自动启动配置保存失败：${error?.message || error}`);
+    }
+    let gateway = null;
+    try {
+      gateway = await startProfileGateway(profileName);
+      if (!gateway?.running) warnings.push(gateway?.error || gateway?.status || '网关未能启动。');
+    } catch (error) {
+      warnings.push(`网关启动失败：${error?.message || error}`);
+    }
+    const runtime = await hermesRuntimeStatus().catch(() => null);
+    res.json({ agent, agents: state.agents, profile, gateway, runtime, ...(warnings.length ? { gatewayWarning: warnings.join('\n') } : {}) });
   } catch (error) {
     res.status(error.status || 500).json({ error: error.message || 'Agent 创建失败。' });
   }
@@ -7839,8 +8268,9 @@ app.get('/api/telemetry/status', async (_req, res) => {
   res.json(telemetry.status());
 });
 
-app.post('/api/telemetry/onboarding-completed', async (_req, res) => {
-  captureTelemetry('onboarding_completed', { hermes_source: process.env.FRAKIO_WORK_HERMES_SOURCE || 'unknown', import_result: 'completed' });
+app.post('/api/telemetry/onboarding-completed', async (req, res) => {
+  const importResult = ['completed', 'skipped', 'failed'].includes(req.body?.importResult) ? req.body.importResult : 'skipped';
+  captureTelemetry('onboarding_completed', { hermes_source: process.env.FRAKIO_WORK_HERMES_SOURCE || 'unknown', import_result: importResult });
   res.json({ ok: true });
 });
 
@@ -8179,6 +8609,7 @@ app.post('/api/conversations', async (req, res) => {
   const primaryAgent = state.agents.find((agent) => agent.id === primaryAgentId);
   const selectedAgents = Array.from(new Set([primaryAgentId || defaultAgentId].filter(Boolean)));
   const agentModelOverrides = normalizeAgentModelOverrides(req.body?.agentModelOverrides, state.agents, state.models);
+  const agentRunOverrides = normalizeAgentRunOverrides(req.body?.agentRunOverrides, state.agents);
   const thread = createThreadRecord({
     spaceId,
     workspaceId: null,
@@ -8186,6 +8617,7 @@ app.post('/api/conversations', async (req, res) => {
     vaultId: null,
     selectedAgents,
     agentModelOverrides,
+    agentRunOverrides,
     mode: 'direct',
     primaryAgentId,
     defaultAgentId: primaryAgentId,
@@ -8259,6 +8691,7 @@ app.post('/api/workspaces/:id/threads', async (req, res) => {
     vaultId,
     selectedAgents: Array.from(new Set([defaultAgentId, 'max'].filter(Boolean))),
     agentModelOverrides: normalizeAgentModelOverrides(req.body?.agentModelOverrides, state.agents, state.models),
+    agentRunOverrides: normalizeAgentRunOverrides(req.body?.agentRunOverrides, state.agents),
     mode: 'workspace',
     primaryAgentId: defaultAgentId,
     defaultAgentId,
@@ -8291,6 +8724,7 @@ app.patch('/api/threads/:id', async (req, res) => {
   if ('vaultId' in req.body && thread.mode !== 'workspace') thread.vaultId = req.body.vaultId || null;
   if (Array.isArray(req.body.selectedAgents)) thread.selectedAgents = req.body.selectedAgents;
   if ('agentModelOverrides' in req.body) thread.agentModelOverrides = normalizeAgentModelOverrides(req.body.agentModelOverrides, state.agents, state.models);
+  if ('agentRunOverrides' in req.body) thread.agentRunOverrides = normalizeAgentRunOverrides(req.body.agentRunOverrides, state.agents);
   if ('mode' in req.body && ['workspace', 'direct'].includes(req.body.mode)) thread.mode = req.body.mode;
   if ('primaryAgentId' in req.body && state.agents.some((agent) => agent.id === req.body.primaryAgentId)) thread.primaryAgentId = req.body.primaryAgentId;
   if ('defaultAgentId' in req.body && state.agents.some((agent) => agent.id === req.body.defaultAgentId)) thread.defaultAgentId = req.body.defaultAgentId;
@@ -8409,7 +8843,7 @@ app.post('/api/threads/:id/convert-to-workspace', async (req, res) => {
   }
 });
 
-function createThreadRecord({ spaceId, workspaceId, title, vaultId, selectedAgents, agentModelOverrides = {}, mode, primaryAgentId, defaultAgentId, followMode = 'default', intro, agents = [] }) {
+function createThreadRecord({ spaceId, workspaceId, title, vaultId, selectedAgents, agentModelOverrides = {}, agentRunOverrides = {}, mode, primaryAgentId, defaultAgentId, followMode = 'default', intro, agents = [] }) {
   const threadDefaultAgentId = defaultAgentId || primaryAgentId || selectedAgents?.[0] || 'iris';
   const introAgent = agents.find((agent) => agent.id === threadDefaultAgentId) || agents.find((agent) => agent.id === 'iris') || { id: 'iris', name: 'Iris', role: '书记官 / 默认入口' };
   return {
@@ -8425,6 +8859,7 @@ function createThreadRecord({ spaceId, workspaceId, title, vaultId, selectedAgen
     vaultId,
     selectedAgents,
     agentModelOverrides,
+    agentRunOverrides,
     permissionMode: 'manual',
     archivedAt: null,
     pinnedAt: null,
@@ -8471,6 +8906,7 @@ function summarizeThread(thread, state) {
     primaryAgentName: primaryAgent?.name || '',
     permissionMode: thread.permissionMode || 'manual',
     agentModelOverrides: thread.agentModelOverrides || {},
+    agentRunOverrides: thread.agentRunOverrides || {},
     vaultId: thread.vaultId,
     vaultName: vault?.name || '未连接资料库',
     updatedAt: thread.updatedAt,
@@ -8622,7 +9058,7 @@ async function resolveThreadRunModelConfig(state, thread, agent, profileName) {
     const { selectedModel, selectedName } = resolveModelSelection(override, state.models || []);
     if (selectedModel) {
       const materialized = await ensureModelProviderForProfile(profileName, selectedModel, selectedName, state.models || [], { setDefault: false });
-      return { model: materialized.model, provider: materialized.provider, source: 'thread' };
+      return { model: materialized.model, provider: materialized.provider, source: 'thread', modelProfile: selectedModel };
     }
   }
   const config = await readYamlFile(profileConfigPath(profileName));
@@ -8632,19 +9068,19 @@ async function resolveThreadRunModelConfig(state, thread, agent, profileName) {
     const profileModels = normalizeModels(state.models || []).filter((item) => item.providerKey === provider && normalizeModelNames(item.models, item.model).includes(model));
     if (profileModels.length === 1) {
       const materialized = await ensureModelProviderForProfile(profileName, profileModels[0], model, state.models || [], { setDefault: false });
-      return { model: materialized.model, provider: materialized.provider, source: 'profile' };
+      return { model: materialized.model, provider: materialized.provider, source: 'profile', modelProfile: profileModels[0] };
     }
     if (providerPresetByKey(provider)) {
       throw configValidationError(`${providerPresetByKey(provider)?.label || providerLabel(provider)} 尚未配置 API Key。`);
     }
-    return { model, provider, source: 'profile' };
+    return { model, provider, source: 'profile', modelProfile: null };
   }
   const fallback = resolveModelSelection(agent?.model || '', state.models || []);
   if (fallback.selectedModel) {
     const materialized = await ensureModelProviderForProfile(profileName, fallback.selectedModel, fallback.selectedName, state.models || [], { setDefault: false });
-    return { model: materialized.model, provider: materialized.provider, source: 'agent' };
+    return { model: materialized.model, provider: materialized.provider, source: 'agent', modelProfile: fallback.selectedModel };
   }
-  return { model: '', provider: '', source: 'profile' };
+  return { model: '', provider: '', source: 'profile', modelProfile: null };
 }
 
 async function resolveHermesProfileNameForAgent(agent) {
@@ -9323,6 +9759,18 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     const profileName = await resolveHermesProfileNameForAgent(primaryAgent);
     runProfileName = profileName;
     const runModel = await resolveThreadRunModelConfig(state, thread, primaryAgent, profileName);
+    const requestedRunSettings = normalizeAgentRunOverrides(thread.agentRunOverrides, state.agents)[primaryAgent.id] || {};
+    const runCapability = runModel.modelProfile ? resolveModelCapability(runModel.modelProfile, runModel.model, { providerCatalog: flattenProviderCatalog(modelCatalogCache) }) : null;
+    const runMapping = runModel.modelProfile && runCapability
+      ? mapRunSettings(runModel.modelProfile, runCapability, requestedRunSettings)
+      : { requestedReasoning: 'default', effectiveReasoning: 'default', requestedServiceTier: 'standard', effectiveServiceTier: 'standard', runtimeOverrides: {} };
+    const sanitizedRunSettings = {
+      ...(requestedRunSettings.reasoningEffort && typeof runCapability?.reasoningMap?.[requestedRunSettings.reasoningEffort] === 'string' ? { reasoningEffort: requestedRunSettings.reasoningEffort } : {}),
+      ...(requestedRunSettings.speedMode === 'standard' || runCapability?.serviceTiers?.some((tier) => tier.id === requestedRunSettings.speedMode || requestedRunSettings.speedMode === 'fast') ? { speedMode: requestedRunSettings.speedMode } : {}),
+    };
+    thread.agentRunOverrides = { ...(thread.agentRunOverrides || {}) };
+    if (sanitizedRunSettings.reasoningEffort || sanitizedRunSettings.speedMode) thread.agentRunOverrides[primaryAgent.id] = sanitizedRunSettings;
+    else delete thread.agentRunOverrides[primaryAgent.id];
     await ensureWorkbenchMcpServers(profileName);
     const missingMcpCommands = await findMissingMcpCommands(profileName);
     if (missingMcpCommands.length) {
@@ -9369,6 +9817,7 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       profile: profileName,
       model: runModel.model || undefined,
       provider: runModel.provider || undefined,
+      runtime_overrides: runMapping.runtimeOverrides,
       source: 'frakio-workbench',
     }, {
       timeoutMs: 30000,
@@ -9392,7 +9841,24 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       route_reason: explicitlyMentionedPrimaryAgent ? 'user_mention' : thread.followMode === 'conversation' ? 'conversation_follow' : 'default_agent',
     });
     captureMeaningfulActivity('agent_run_started');
-    res.status(202).json({ runId: started.run_id, sessionId: started.session_id || sessionId, status: started.status || 'started', runtime: 'hermes-bridge', profileName, model: runModel.model, provider: runModel.provider, modelSource: runModel.source, bridge });
+    res.status(202).json({
+      runId: started.run_id,
+      sessionId: started.session_id || sessionId,
+      status: started.status || 'started',
+      runtime: 'hermes-bridge',
+      profileName,
+      model: runModel.model,
+      provider: runModel.provider,
+      modelSource: runModel.source,
+      requestedReasoning: runMapping.requestedReasoning,
+      effectiveReasoning: runMapping.effectiveReasoning,
+      requestedServiceTier: runMapping.requestedServiceTier,
+      effectiveServiceTier: runMapping.effectiveServiceTier,
+      reasoningEffort: runMapping.effectiveReasoning,
+      speedMode: runMapping.effectiveServiceTier,
+      capabilitySource: runCapability?.source || 'profile',
+      bridge,
+    });
   } catch (error) {
     const details = { ...hermesRuntimeErrorDetails(error, error.details?.profileName || runProfileName), ...(error.details || {}) };
     const enriched = enrichMissingExecutableError(error.message || 'Hermes Bridge run 创建失败。', details.profileName || runProfileName);
@@ -9639,6 +10105,10 @@ export async function createApp() {
   await runPresetProviderCredentialMigration().catch((error) => {
     console.warn('Preset Provider credential migration skipped:', error?.message || error);
   });
+  await readState();
+  await runLegacyDemoDataCleanupMigration().catch((error) => {
+    console.warn('Legacy demo data cleanup skipped:', error?.message || error);
+  });
   const initialTelemetryState = await readState();
   await telemetry.initialize();
   await telemetry.setEnabled(initialTelemetryState.ui?.telemetryEnabled === true && Boolean(initialTelemetryState.ui?.telemetryNoticeSeenAt));
@@ -9663,6 +10133,7 @@ export async function startServer() {
         console.warn('Hermes runtime auto-start failed:', error?.message || error);
       });
     }, 100);
+    setTimeout(() => void refreshStaleProviderCatalogs().catch(() => {}), 400);
   });
   return httpServer;
 }

@@ -27,13 +27,16 @@ try {
           contentType: 'application/json',
           body: JSON.stringify({
             autoStart: {
-              status: ready ? 'partial' : 'starting',
+              status: ready ? 'ready' : 'starting',
               startedAt: new Date().toISOString(),
               finishedAt: ready ? new Date().toISOString() : null,
               steps: [
-                { id: 'profiles', label: '读取本地 Hermes Profiles', status: 'ready', detail: '7 profiles' },
-                { id: 'api', label: '启动 Frakio Work Runtime API', status: ready ? 'failed' : 'running', detail: ready ? 'stderr: Runtime API did not become ready\nfull command must not leak into the loading page' : 'http://127.0.0.1:8643/v1' },
+                { id: 'profiles', label: '读取本地 Hermes Profiles', status: 'ready', severity: 'standard', detail: '7 profiles' },
+                { id: 'bridge', label: '启动 Frakio Work Bridge', status: 'ready', severity: 'core', detail: 'ipc:///tmp/frakio-work.sock' },
+                { id: 'api', label: '启动外部兼容 API', status: ready ? 'warning' : 'running', severity: 'optional', detail: ready ? 'stderr: External API did not become ready\nfull command must not leak into the loading page' : 'http://127.0.0.1:8643/v1' },
               ],
+              error: '',
+              warnings: ready ? ['启动外部兼容 API: External API did not become ready'] : [],
             },
           }),
         });

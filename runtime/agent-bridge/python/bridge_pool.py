@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -42,6 +43,69 @@ from bridge_runtime import (
     _title_user_message,
     _tool_names_from_definitions,
 )
+
+
+_PROTECTED_RUN_OVERRIDE_KEYS = {
+    "authorization", "api_key", "api-key", "x-api-key", "host", "content-length",
+    "stream", "stream_options", "transfer-encoding", "connection", "proxy-authorization",
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+}
+
+
+@contextmanager
+def _temporary_run_overrides(agent: Any, reasoning_effort: str | None = None, speed_mode: str | None = None, speed_provider_mode: str | None = None, runtime_overrides: dict[str, Any] | None = None):
+    saved_reasoning_config = getattr(agent, "reasoning_config", None)
+    saved_service_tier = getattr(agent, "service_tier", None)
+    saved_request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    did_override_reasoning = False
+    did_override_speed = speed_mode in {"standard", "fast"}
+    runtime_overrides = runtime_overrides if isinstance(runtime_overrides, dict) else {}
+    direct_reasoning = runtime_overrides.get("reasoning_config")
+    direct_service_tier = runtime_overrides.get("service_tier")
+    direct_request_overrides = runtime_overrides.get("request_overrides")
+    if isinstance(direct_reasoning, dict):
+        agent.reasoning_config = dict(direct_reasoning)
+        did_override_reasoning = True
+    if reasoning_effort and not did_override_reasoning:
+        try:
+            from hermes_constants import parse_reasoning_effort
+
+            override_config = parse_reasoning_effort(str(reasoning_effort).strip())
+            if override_config is not None:
+                agent.reasoning_config = override_config
+                did_override_reasoning = True
+        except Exception:
+            pass
+    if did_override_speed:
+        next_overrides = dict(saved_request_overrides)
+        next_overrides.pop("service_tier", None)
+        next_overrides.pop("speed", None)
+        agent.service_tier = None
+        if speed_mode == "fast" and speed_provider_mode == "openai_priority":
+            agent.service_tier = "priority"
+            next_overrides["service_tier"] = "priority"
+        elif speed_mode == "fast" and speed_provider_mode == "anthropic_fast":
+            next_overrides["speed"] = "fast"
+        agent.request_overrides = next_overrides
+    if direct_service_tier is not None or isinstance(direct_request_overrides, dict):
+        did_override_speed = True
+        next_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+        if direct_service_tier is not None:
+            agent.service_tier = str(direct_service_tier)
+            next_overrides["service_tier"] = str(direct_service_tier)
+        for key, value in (direct_request_overrides or {}).items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key and normalized_key not in _PROTECTED_RUN_OVERRIDE_KEYS:
+                next_overrides[str(key)] = value
+        agent.request_overrides = next_overrides
+    try:
+        yield
+    finally:
+        if did_override_reasoning:
+            agent.reasoning_config = saved_reasoning_config
+        if did_override_speed:
+            agent.service_tier = saved_service_tier
+            agent.request_overrides = saved_request_overrides
 
 
 def _bind_session_workspace_cwd(session_id: str, workspace: str | None) -> bool:
@@ -1215,6 +1279,9 @@ class AgentPool:
         workspace: str | None = None,
         source: str | None = None,
         reasoning_effort: str | None = None,
+        speed_mode: str | None = None,
+        speed_provider_mode: str | None = None,
+        runtime_overrides: dict[str, Any] | None = None,
     ) -> RunRecord:
         session = self.get_or_create(session_id, profile=profile, model=model, provider=provider)
         with session.lock:
@@ -1238,14 +1305,14 @@ class AgentPool:
 
         thread = threading.Thread(
             target=self._run_chat,
-            args=(session, record, message, storage_message, attachments, instructions, conversation_history, profile, force_compress, workspace, source, reasoning_effort),
+            args=(session, record, message, storage_message, attachments, instructions, conversation_history, profile, force_compress, workspace, source, reasoning_effort, speed_mode, speed_provider_mode, runtime_overrides),
             daemon=True,
             name=f"hermes-bridge-run-{run_id[:8]}",
         )
         thread.start()
         return record
 
-    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, attachments: list[dict[str, Any]] | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None) -> None:
+    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, attachments: list[dict[str, Any]] | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, workspace: str | None = None, source: str | None = None, reasoning_effort: str | None = None, speed_mode: str | None = None, speed_provider_mode: str | None = None, runtime_overrides: dict[str, Any] | None = None) -> None:
         with _profile_env(profile):
             _refresh_approval_allowlist()
             _install_execute_code_approval_memory_patch()
@@ -1317,31 +1384,11 @@ class AgentPool:
                     kwargs["system_message"] = instructions
                 if conversation_history is not None:
                     kwargs["conversation_history"] = conversation_history
-                # Local patch (reasoning-effort): per-run reasoning effort override (Web UI brain button).
-                # Mutates session.agent.reasoning_config in place — restored after run.
-                _saved_reasoning_config = None
-                _did_override_reasoning = False
-                if reasoning_effort:
-                    try:
-                        from hermes_constants import parse_reasoning_effort
-                        override_cfg = parse_reasoning_effort(str(reasoning_effort).strip())
-                        # parse_reasoning_effort returns None for invalid input; only
-                        # override when we got a recognized value.
-                        if override_cfg is not None:
-                            _saved_reasoning_config = getattr(session.agent, "reasoning_config", None)
-                            session.agent.reasoning_config = override_cfg
-                            _did_override_reasoning = True
-                    except Exception:
-                        # Non-fatal: fall through to default reasoning_config
-                        pass
-                try:
+                with _temporary_run_overrides(session.agent, reasoning_effort, speed_mode, speed_provider_mode, runtime_overrides):
                     result = session.agent.run_conversation(
                         agent_message,
                         **kwargs,
                     )
-                finally:
-                    if _did_override_reasoning:
-                        session.agent.reasoning_config = _saved_reasoning_config
                 result = _jsonable(result if isinstance(result, dict) else {"value": result})
                 result_for_tail_sync = result
                 self._sync_result_tail_to_session_db(

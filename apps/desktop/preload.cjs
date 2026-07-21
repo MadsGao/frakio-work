@@ -9,4 +9,5 @@ contextBridge.exposeInMainWorld('frakioDesktop', {
   windowControl: (action) => ipcRenderer.invoke('frakio:window-control', action),
   showItemInFolder: (targetPath) => ipcRenderer.invoke('frakio:show-item-in-folder', String(targetPath || '')),
   openRelease: (targetUrl) => ipcRenderer.invoke('frakio:open-release', String(targetUrl || '')),
+  openExternal: (targetUrl) => ipcRenderer.invoke('frakio:open-external', String(targetUrl || '')),
 });

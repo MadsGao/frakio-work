@@ -5,16 +5,17 @@ type LaunchPhase = 'booting' | 'connecting' | 'welcome';
 type LaunchStep = {
   id: string;
   label: string;
-  status: 'running' | 'ready' | 'failed' | 'skipped';
+  status: 'running' | 'ready' | 'failed' | 'warning' | 'skipped';
+  severity: 'core' | 'standard' | 'optional';
   detail?: string;
 };
 type AutoStart = { steps?: LaunchStep[] } | null;
 
 const fallbackSteps: LaunchStep[] = [
-  { id: 'profiles', label: '读取本地 Hermes Profiles', status: 'running' },
-  { id: 'bridge', label: '启动 Frakio Work Bridge', status: 'running' },
-  { id: 'api', label: '启动 Frakio Work Runtime API', status: 'running' },
-  { id: 'gateways', label: '启动 Profile Gateway', status: 'running' },
+  { id: 'profiles', label: '读取本地 Hermes Profiles', status: 'running', severity: 'core' },
+  { id: 'bridge', label: '启动 Frakio Work Bridge', status: 'running', severity: 'core' },
+  { id: 'api', label: '启动外部兼容 API', status: 'running', severity: 'optional' },
+  { id: 'gateways', label: '启动 Profile Gateway', status: 'running', severity: 'standard' },
 ];
 
 export function summarizeLaunchDetail(value = '') {
@@ -54,10 +55,11 @@ export function LaunchLoadingScreen({ phase, agentName, userAvatarUrl, autoStart
                 const done = step.status === 'ready' || step.status === 'skipped';
                 const active = step.status === 'running';
                 const failed = step.status === 'failed';
+                const warning = step.status === 'warning';
                 const Icon = done ? CheckCircle2 : active ? Clock3 : Circle;
                 const detail = summarizeLaunchDetail(step.detail);
                 return (
-                  <div className={`task-row ${done ? 'done' : ''} ${active ? 'active' : ''} ${failed ? 'failed' : ''}`} key={step.id}>
+                  <div className={`task-row ${done ? 'done' : ''} ${active ? 'active' : ''} ${failed ? 'failed' : ''} ${warning ? 'warning' : ''}`} key={step.id}>
                     <Icon size={15} />
                     <span><strong>{step.label}</strong>{detail && <small>{detail}</small>}</span>
                   </div>

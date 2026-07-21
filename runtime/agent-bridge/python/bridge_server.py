@@ -70,6 +70,9 @@ class BridgeServer:
             source = req.get("source")
             # Local patch (reasoning-effort): per-session reasoning effort override (Web UI brain button).
             reasoning_effort = req.get("reasoning_effort")
+            speed_mode = req.get("speed_mode")
+            speed_provider_mode = req.get("speed_provider_mode")
+            runtime_overrides = req.get("runtime_overrides")
             record = self.pool.start_chat(
                 session_id,
                 message,
@@ -84,6 +87,9 @@ class BridgeServer:
                 workspace,
                 source,
                 reasoning_effort,
+                speed_mode,
+                speed_provider_mode,
+                runtime_overrides,
             )
             if req.get("wait"):
                 timeout = float(req.get("timeout", 0) or 0)

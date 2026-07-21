@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.1.4 Beta — 2026-07-22
+
+### 工作台与 Agent 创建
+
+新安装现在以完全空白的工作台开始，不再自动创建示例 Agent、模型、欢迎对话或知识库。旧安装升级时会先备份 state，只清理仍与历史内置内容完全一致的演示数据；用户创建、编辑、同步、引用或配置过密钥的内容不会被删除。本地 Hermes Profile 只有在用户主动点击“同步本地 Hermes 设置”后才会导入。
+
+Agent 现在可以在尚未配置模型时创建。首个 Agent 会成为默认 Agent，创建完成后立即尝试启动对应 Gateway，并加入按 Profile 自动启动名单。创建请求具备持久化幂等保护，网络重试不会重复创建 Agent；Gateway 启动失败会保留 Agent 并显示可重试状态。没有 Agent 或可用模型时，对话发送会保持禁用并提供对应入口。
+
+Gateway 的首次启动、刷新和重启加入即时加载状态，操作期间不会重复提交。发送消息后输入框立即清空；启动失败时，只有用户没有输入新草稿才恢复原文，避免覆盖正在编辑的内容。
+
+### Provider Adapter 与模型运行参数
+
+模型运行设置改为由 Provider Adapter 和模型能力目录统一驱动。首批覆盖 OpenAI Responses、OpenAI Chat Completions、OpenAI Codex Responses、Anthropic Messages、DeepSeek、OpenRouter、Gemini、LM Studio 和常见第三方中转格式。Provider 可以设置默认协议，单个模型可以覆盖协议；未知中转站使用保守的通用 Adapter，不再因为模型 ID 相同而继承其他线路的能力。
+
+推理强度支持 `off / minimal / low / medium / high / xhigh / max / ultra` 及未来扩展档位，并使用模型级三态映射区分支持、不支持和未知。速度服务层支持标准与快速模式，OpenAI Priority 会转换为 `service_tier: "priority"`。对话切换模型后会重新校验推理和速度设置，无效值恢复到模型默认并同步保存到 Thread。Bridge 只接收服务端已经校验的运行参数，并会在单次运行结束后恢复 Agent 原配置。
+
+IkunCode 改用 OpenAI Codex Responses 请求路径。`gpt-5.6-sol` 提供 `low / medium / high / xhigh / max / ultra` 六档推理和 Priority 快速服务层。修复 DeepSeek 关闭推理时错误发送 `reasoning_effort: "none"` 的问题；官方 DeepSeek 现在发送 `thinking: { type: "disabled" }`，不会再被接口拒绝。
+
+### 模型目录与能力验证
+
+模型目录按 Provider、协议、Base URL 类型和模型 ID 隔离缓存，支持四小时缓存、强制刷新和最后一次成功结果恢复。普通 `/models` 响应只补充模型 ID，不会推测上下文、推理或速度能力；手动覆盖始终优先于 Provider 富目录、Hermes Runtime 目录和 Frakio 精确内置目录。
+
+自动模式下能力未知的 Responses 中转站可以使用“验证并识别能力”。Frakio Work 会先验证连接，再分别探测推理档位和 Priority 服务层。明确的参数错误会标记为不支持，鉴权失败立即停止，限流、超时和服务端错误继续保持未知，不会误报为不支持。探测结果只属于当前 Provider、协议、Base URL 和模型，界面标记为“线路验证”，不会冒充官方确认。该操作由用户主动触发，会产生多次低额度请求；后台目录刷新不会发送推理请求。
+
+### OAuth 授权与 Provider 配置
+
+OpenAI Codex、Claude OAuth 和 Google Gemini OAuth 在授权前不再展示静态候选模型。Codex 授权完成后会使用当前账号令牌和账号 ID 读取账号级模型目录，过滤隐藏模型并按 Provider 优先级排序；实时目录失败时恢复该账号最后一次成功目录，首次失败则保持模型为空，不会创建不完整 Provider。Claude 和 Gemini 在没有账号级目录时才使用明确标记的 Frakio 内置目录。
+
+桌面端增加受控的外部浏览器桥接。Codex、Claude、Google 授权地址和 Frakio GitHub Release 地址经过 HTTPS 域名与路径白名单验证后由系统浏览器打开，其他地址会被拒绝。授权页打开失败时可以手动重试，现有授权轮询继续在 Frakio Work 内完成。
+
+IkunCode、Codex-apikey.fun 和 Claude-apikey.fun 已从“预设”列表移除，新配置统一通过“自定义”添加。旧配置仍保留协议与 Adapter 兼容；自定义填写 IkunCode 官方中转地址时，仍会自动识别 Responses 协议和精确能力映射。Provider 编辑弹窗改为固定标题、独立滚动内容和固定操作栏，长目录错误与能力配置不会再溢出视口。
+
+### 模型菜单与授权交互
+
+对话输入框中的模型选择器改为紧凑的轻量毛玻璃菜单。桌面端主菜单固定锚定在触发按钮附近，二级面板根据可用空间自动向左或向右展开，切换模型、推理和速度分区时主面板不再跳动；窄于 720px 时使用单面板钻取。大量模型只滚动模型列表，菜单保持在视口安全边距内。
+
+选择模型后菜单保持打开，用户可以继续调整推理强度和速度；点击菜单外部、再次点击触发按钮或按 Escape 才会关闭。当前模型、推理档位和速度选项都有清晰的选中标记，未知能力与明确不支持使用不同提示。
+
+Provider 添加、编辑和 OAuth 授权弹窗现在是持久模态。点击遮罩或按 Escape 不会关闭，也不会丢失表单、授权码或轮询状态。用户从系统浏览器返回 Frakio Work 后可以继续原流程；只有右上角关闭、底部取消、保存成功或授权成功才会结束对应弹窗。手动关闭授权窗会同时清理前端轮询和延迟回调。
+
+### Runtime 状态与兼容性
+
+修复 Provider 目录重构后 Runtime API 健康检测引用已删除 `parseModelIds` 导致的启动错误，并统一支持 OpenAI `data`、Hermes `models` 和字符串模型列表。
+
+聊天 Bridge 现在明确属于工作台核心服务；供第三方 OpenAI-compatible 客户端使用的 Runtime API 改名为“外部兼容 API”，并作为可选服务展示。只有 Bridge 等核心服务失败才会把工作台标记为不可用；外部兼容 API 未运行时保留诊断警告，但不会影响 Frakio Work 对话或阻止进入工作台。
+
+本版本继续内置 Hermes Runtime 0.18.2，并补充 Provider 目录、主动能力探测、OAuth 账号目录、外部链接白名单、Runtime 状态、Bridge 运行参数和空白安装流程的回归测试。
+
 ## 0.1.3 Beta — 2026-07-20
 
 ### 重大数据安全修复

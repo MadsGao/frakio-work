@@ -6,6 +6,7 @@ const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const { isAllowedExternalUrl } = require('./external-url.cjs');
 
 const APP_NAME = 'Frakio Work';
 const DEFAULT_PORT = 8787;
@@ -231,13 +232,13 @@ function createWindow() {
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isAllowedReleaseUrl(url)) shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (url.startsWith(apiUrl) || url.startsWith('data:text/html')) return;
     event.preventDefault();
-    if (isAllowedReleaseUrl(url)) shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) shell.openExternal(url);
   });
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
@@ -432,17 +433,14 @@ ipcMain.handle('frakio:show-item-in-folder', async (_event, targetPath) => {
   return { ok: true };
 });
 
-function isAllowedReleaseUrl(targetUrl) {
-  try {
-    const url = new URL(String(targetUrl || ''));
-    return url.protocol === 'https:' && url.hostname === 'github.com' && url.pathname.startsWith('/MadsGao/frakio-work/releases/');
-  } catch {
-    return false;
-  }
-}
-
 ipcMain.handle('frakio:open-release', async (_event, targetUrl) => {
-  if (!isAllowedReleaseUrl(targetUrl)) return { ok: false };
+  if (!isAllowedExternalUrl(targetUrl)) return { ok: false };
+  await shell.openExternal(String(targetUrl));
+  return { ok: true };
+});
+
+ipcMain.handle('frakio:open-external', async (_event, targetUrl) => {
+  if (!isAllowedExternalUrl(targetUrl)) return { ok: false };
   await shell.openExternal(String(targetUrl));
   return { ok: true };
 });
