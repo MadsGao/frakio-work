@@ -114,6 +114,8 @@ async function installPortablePython(staging) {
   const sourceRoot = portablePythonRoot(executable, process.platform);
   const destination = path.join(staging, 'python');
   await cp(sourceRoot, destination, { recursive: true, dereference: true, preserveTimestamps: true });
+  await unlink(path.join(destination, 'EXTERNALLY-MANAGED')).catch(() => null);
+  await unlink(path.join(destination, 'Lib', 'EXTERNALLY-MANAGED')).catch(() => null);
   if (process.platform !== 'win32') {
     await unlink(path.join(destination, 'lib', `python${pythonVersion.split('.').slice(0, 2).join('.')}`, 'EXTERNALLY-MANAGED')).catch(() => null);
     const bin = path.join(destination, 'bin');
@@ -187,10 +189,11 @@ try {
   if (!version) throw new Error(`Cannot read Hermes Agent version from ${pinnedHermesTag}.`);
   const python = await installPortablePython(staging);
   await installPortableNode(staging, downloadsRoot);
-  await command(python, ['-m', 'ensurepip', '--upgrade'], { cwd: staging });
+  const portablePythonEnv = { HERMES_AGENT_ROOT: path.join(staging, 'python'), PIP_BREAK_SYSTEM_PACKAGES: '1' };
+  await command(python, ['-m', 'ensurepip', '--upgrade'], { cwd: staging, env: portablePythonEnv });
   await command(python, ['-m', 'pip', 'install', '--upgrade', '--force-reinstall', '--no-cache-dir', sourceDir, `aiohttp==${aiohttpVersion}`], {
     cwd: sourceDir,
-    env: { HERMES_AGENT_ROOT: path.join(staging, 'python') },
+    env: portablePythonEnv,
   });
   await rewritePythonEntrypoints(staging);
   const versionOutput = await command(python, ['-m', 'hermes_cli.main', '--version'], { cwd: staging, timeout: 30000, env: { HERMES_AGENT_ROOT: path.join(staging, 'python') } });
