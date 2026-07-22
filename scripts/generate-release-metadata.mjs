@@ -29,8 +29,11 @@ for (const name of files) {
 const prefix = `Frakio-Work-${platform}-${arch}`;
 await writeFile(path.join(releaseDir, `${prefix}-SHA256SUMS.txt`), `${checksumLines.join('\n')}\n`, 'utf8');
 
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const { stdout: sbom } = await execFileAsync(npm, ['sbom', '--sbom-format', 'cyclonedx'], {
+const npmCommand = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : 'npm';
+const npmArgs = process.platform === 'win32'
+  ? ['/d', '/s', '/c', 'npm.cmd sbom --sbom-format cyclonedx']
+  : ['sbom', '--sbom-format', 'cyclonedx'];
+const { stdout: sbom } = await execFileAsync(npmCommand, npmArgs, {
   cwd: path.resolve('.'),
   maxBuffer: 50 * 1024 * 1024,
 });
