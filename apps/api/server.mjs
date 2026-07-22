@@ -21,7 +21,7 @@ import { probeResponsesCapabilities } from './lib/capability-probe.mjs';
 import { createLocalSecurity } from './lib/local-security.mjs';
 import { isSystemHermesProfile, resolveDeletableHermesProfileDir, userVisibleHermesProfiles } from './lib/hermes-profile-safety.mjs';
 import { resolveInsideRoot } from './lib/path-boundary.mjs';
-import { resolveCommand as resolvePlatformCommand, runtimeNodeCandidate, runtimePlatformDir, runtimePythonCandidates } from './lib/platform.mjs';
+import { resolveCommand as resolvePlatformCommand, runtimeNodeCandidate, runtimePlatformDir, runtimePythonCandidates, runtimePythonSitePackagesCandidates } from './lib/platform.mjs';
 import { capabilitiesForModels, mapRunSettings, normalizeCapabilityOverrides, resolveModelCapability } from './lib/model-capabilities.mjs';
 import { createModelRunDiagnostic, finishModelRunDiagnostic, markModelRunSent } from './lib/model-run-diagnostics.mjs';
 import { CHAT_THINKING_FORMATS, candidateModelUrls, directHttpRequestOverrides } from './lib/provider-adapters.mjs';
@@ -488,12 +488,13 @@ function inspectHermesRuntimeDir(runtimeDir, source) {
   const node = existsSync(hermesNodeCandidate(runtimeDir)) ? hermesNodeCandidate(runtimeDir) : '';
   const manifest = readRuntimeManifestSync(runtimeDir);
   const pythonLib = path.join(runtimeDir, 'python', 'lib');
-  const sitePackages = existsSync(pythonLib)
+  const sitePackages = runtimePythonSitePackagesCandidates(runtimeDir)
+    .find((candidate) => existsSync(path.join(candidate, 'run_agent.py'))) || (existsSync(pythonLib)
     ? readdirSync(pythonLib, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && entry.name.startsWith('python'))
       .map((entry) => path.join(pythonLib, entry.name, 'site-packages'))
       .find((candidate) => existsSync(path.join(candidate, 'run_agent.py')))
-    : '';
+    : '');
   return {
     source,
     runtimeDir,

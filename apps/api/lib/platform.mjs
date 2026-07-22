@@ -24,6 +24,12 @@ export function runtimeNodeCandidate(runtimeDir, platform = process.platform) {
   return platformPath.join(runtimeDir, 'node', platform === 'win32' ? 'node.exe' : 'bin/node');
 }
 
+export function runtimePythonSitePackagesCandidates(runtimeDir, platform = process.platform) {
+  const platformPath = platform === 'win32' ? path.win32 : path.posix;
+  if (platform === 'win32') return [platformPath.join(runtimeDir, 'python', 'Lib', 'site-packages')];
+  return [];
+}
+
 export async function resolveCommand(command, { cwd = process.cwd(), env = process.env, platform = process.platform } = {}) {
   const clean = String(command || '').trim();
   if (!clean) return '';
