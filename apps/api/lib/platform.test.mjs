@@ -10,8 +10,8 @@ test('runtime platform names cover supported operating systems', () => {
 });
 
 test('runtime executable paths use native Windows filenames', () => {
-  assert.deepEqual(runtimePythonCandidates('C:\\runtime', 'win32'), ['C:\\runtime/python/python.exe']);
-  assert.equal(runtimeNodeCandidate('C:\\runtime', 'win32'), 'C:\\runtime/node/node.exe');
+  assert.deepEqual(runtimePythonCandidates('C:\\runtime', 'win32'), ['C:\\runtime\\python\\python.exe']);
+  assert.equal(runtimeNodeCandidate('C:\\runtime', 'win32'), 'C:\\runtime\\node\\node.exe');
   assert.deepEqual(runtimePythonCandidates('/runtime', 'darwin'), ['/runtime/python/bin/python3', '/runtime/python/bin/python']);
   assert.equal(runtimeNodeCandidate('/runtime', 'darwin'), '/runtime/node/bin/node');
 });

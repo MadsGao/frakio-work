@@ -1,5 +1,4 @@
 const assert = require('node:assert/strict');
-const path = require('node:path');
 const test = require('node:test');
 const { electronNodeExecutable } = require('./platform-paths.cjs');
 
@@ -17,5 +16,5 @@ test('packaged desktop resolves the Electron node executable per platform', () =
     platform: 'win32',
     resourcesPath: String.raw`C:\Users\runner\AppData\Local\Programs\frakio-work\resources`,
     execPath: windowsExecutable,
-  }), path.resolve(windowsExecutable));
+  }), windowsExecutable);
 });

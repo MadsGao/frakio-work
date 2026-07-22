@@ -14,12 +14,14 @@ export function runtimePlatformDir(platform = process.platform, arch = process.a
 }
 
 export function runtimePythonCandidates(runtimeDir, platform = process.platform) {
-  if (platform === 'win32') return [path.join(runtimeDir, 'python', 'python.exe')];
-  return [path.join(runtimeDir, 'python', 'bin', 'python3'), path.join(runtimeDir, 'python', 'bin', 'python')];
+  const platformPath = platform === 'win32' ? path.win32 : path.posix;
+  if (platform === 'win32') return [platformPath.join(runtimeDir, 'python', 'python.exe')];
+  return [platformPath.join(runtimeDir, 'python', 'bin', 'python3'), platformPath.join(runtimeDir, 'python', 'bin', 'python')];
 }
 
 export function runtimeNodeCandidate(runtimeDir, platform = process.platform) {
-  return path.join(runtimeDir, 'node', platform === 'win32' ? 'node.exe' : 'bin/node');
+  const platformPath = platform === 'win32' ? path.win32 : path.posix;
+  return platformPath.join(runtimeDir, 'node', platform === 'win32' ? 'node.exe' : 'bin/node');
 }
 
 export async function resolveCommand(command, { cwd = process.cwd(), env = process.env, platform = process.platform } = {}) {
