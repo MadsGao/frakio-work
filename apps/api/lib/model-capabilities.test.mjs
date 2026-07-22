@@ -26,6 +26,35 @@ test('same model id on an unknown relay stays unknown', () => {
   assert.deepEqual(capability.serviceTiers, []);
 });
 
+test('official Codex rich catalog keeps declared fields and fills only missing built-in dimensions', () => {
+  const provider = model({ providerKey: 'openai-codex', baseUrl: 'https://chatgpt.com/backend-api/codex', apiMode: 'codex_responses' });
+  const key = catalogKey(provider, 'gpt-5.6-sol');
+  const capability = resolveModelCapability(provider, 'gpt-5.6-sol', { providerCatalog: {
+    [key]: {
+      modelId: 'gpt-5.6-sol', source: 'provider_catalog', status: 'confirmed',
+      reasoningMap: {}, reasoningStatus: 'unknown',
+      serviceTiers: [{ id: 'account-fast', name: 'Account Fast', requestValue: 'priority' }], serviceTierStatus: 'confirmed',
+    },
+  } });
+  assert.deepEqual(capability.reasoningEfforts, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+  assert.equal(capability.serviceTiers[0].id, 'account-fast');
+  assert.equal(capability.source, 'provider_catalog');
+});
+
+test('official Codex explicit empty reasoning support is not replaced by built-in data', () => {
+  const provider = model({ providerKey: 'openai-codex', baseUrl: 'https://chatgpt.com/backend-api/codex', apiMode: 'codex_responses' });
+  const key = catalogKey(provider, 'gpt-5.6-sol');
+  const capability = resolveModelCapability(provider, 'gpt-5.6-sol', { providerCatalog: {
+    [key]: {
+      modelId: 'gpt-5.6-sol', source: 'provider_catalog', status: 'confirmed',
+      reasoningMap: {}, reasoningStatus: 'unsupported', serviceTiers: [], serviceTierStatus: 'unsupported',
+    },
+  } });
+  assert.deepEqual(capability.reasoningEfforts, []);
+  assert.equal(capability.reasoningStatus, 'unsupported');
+  assert.deepEqual(capability.serviceTiers, []);
+});
+
 test('active probe capabilities do not survive a Base URL change', () => {
   const relay = model({ providerKey: 'custom:relay', baseUrl: 'https://new.example/v1', apiMode: 'codex_responses' });
   const key = catalogKey(relay, 'gpt-5.6-sol');

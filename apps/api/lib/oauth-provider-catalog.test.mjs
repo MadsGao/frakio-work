@@ -30,6 +30,8 @@ test('Codex catalog request sends the account id from the OAuth token', async ()
   assert.equal(extractChatGptAccountId(accessToken), 'acct-123');
   assert.equal(request.options.headers.Authorization, `Bearer ${accessToken}`);
   assert.equal(request.options.headers['ChatGPT-Account-Id'], 'acct-123');
+  assert.equal(request.options.headers.originator, 'codex_cli_rs');
+  assert.match(request.options.headers['User-Agent'], /codex_cli_rs/);
   assert.deepEqual(result.models.map((model) => model.id), ['gpt-test']);
 });
 

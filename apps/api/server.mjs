@@ -25,7 +25,7 @@ import { resolveCommand as resolvePlatformCommand, runtimePlatformDir } from './
 import { capabilitiesForModels, mapRunSettings, normalizeCapabilityOverrides, resolveModelCapability } from './lib/model-capabilities.mjs';
 import { CHAT_THINKING_FORMATS, candidateModelUrls } from './lib/provider-adapters.mjs';
 import { catalogStatus, flattenProviderCatalog, parseCatalogResponse, parseModelIds, readCatalogCache, recordActiveProbeCapability, recordCatalogError, updateProviderCatalog, verificationKey, writeCatalogCache } from './lib/model-catalog-store.mjs';
-import { fetchCodexOAuthCatalog } from './lib/oauth-provider-catalog.mjs';
+import { extractChatGptAccountId, fetchCodexOAuthCatalog } from './lib/oauth-provider-catalog.mjs';
 import { runtimeStep, summarizeRuntimeAutoStart } from './lib/runtime-autostart.mjs';
 
 const app = express();
@@ -1122,6 +1122,35 @@ function comparableBaseUrl(value) {
   return String(value || '').trim().replace(/\/+$/, '').toLowerCase();
 }
 
+function verificationRoutePrefix(model) {
+  return [String(model?.providerKey || '').trim(), String(model?.apiMode || '').trim(), comparableBaseUrl(model?.baseUrl)].join('::') + '::';
+}
+
+function credentialOrigin(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return url.protocol === 'https:' ? url.origin.toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+function canReuseCredentialForBaseUrl(savedBaseUrl, requestedBaseUrl) {
+  const savedOrigin = credentialOrigin(savedBaseUrl);
+  return Boolean(savedOrigin && savedOrigin === credentialOrigin(requestedBaseUrl));
+}
+
+async function credentialForModelDraft(savedModel, requestedBaseUrl, explicitApiKey, models = []) {
+  const provided = String(explicitApiKey || '').trim();
+  if (provided) return provided;
+  const reusable = await getReusableModelSecret(savedModel, models);
+  if (!reusable) return '';
+  if (!canReuseCredentialForBaseUrl(savedModel.baseUrl, requestedBaseUrl)) {
+    throw Object.assign(new Error('Base URL 的地址已变化，请重新输入 API Key。'), { status: 400 });
+  }
+  return reusable;
+}
+
 function customProviderBaseName(model) {
   const provider = String(model?.provider || '').trim();
   const preferred = provider && !/^custom$/i.test(provider) ? provider : String(model?.name || '').trim();
@@ -2051,6 +2080,173 @@ async function saveGeminiOAuthTokens(profileName, tokenData, email = '') {
   auth.credential_pool = auth.credential_pool || {};
   auth.credential_pool[geminiProviderKey] = [{ id: `${geminiProviderKey}-${Date.now()}`, label: 'Google Gemini OAuth', auth_type: 'oauth', source: 'loopback_pkce', priority: 0, access_token: accessToken, refresh_token: refreshToken, expires_at_ms: expiresAtMs, email, base_url: 'cloudcode-pa://google' }];
   saveAuthJsonSync(authPath, auth);
+}
+
+function providerVerificationError(message, status = 400, code = 'provider_rejected') {
+  return Object.assign(new Error(message), { status, code });
+}
+
+function officialOAuthBaseUrl(providerKey, requestedBaseUrl) {
+  const expected = String(providerPresetByKey(providerKey)?.baseUrl || '').trim();
+  if (!expected || comparableBaseUrl(expected) !== comparableBaseUrl(requestedBaseUrl)) {
+    throw providerVerificationError('OAuth Provider 的官方 Base URL 不能修改。', 400, 'provider_rejected');
+  }
+  return expected;
+}
+
+function oauthTokenForVerification(profileName, providerKey) {
+  const token = oauthProviderAccessToken(profileName, providerKey);
+  if (!token) throw providerVerificationError('授权已失效，请重新授权。', 401, 'oauth_expired');
+  return token;
+}
+
+function providerErrorMessage(result, fallback) {
+  return String(result?.body?.error?.message || result?.body?.error?.status || result?.body?.message || fallback).slice(0, 500);
+}
+
+function throwNativeVerificationFailure(result, providerLabel) {
+  if (result.status === 401) throw providerVerificationError(`${providerLabel} 授权已失效，请重新授权。`, 401, 'oauth_expired');
+  if (result.status === 403) throw providerVerificationError(`${providerLabel} 拒绝了当前账号请求。`, 403, 'provider_rejected');
+  throw providerVerificationError(`${providerLabel} 验证失败：${providerErrorMessage(result, `HTTP ${result.status || 502}`)}`, result.status || 502, 'provider_rejected');
+}
+
+async function verifyCodexOAuthProvider(profileName, modelId) {
+  const accessToken = oauthTokenForVerification(profileName, 'openai-codex');
+  let catalog;
+  try {
+    catalog = await refreshCodexOAuthModels(accessToken);
+  } catch (error) {
+    if (error?.status === 401) throw providerVerificationError('OpenAI Codex 授权已失效，请重新授权。', 401, 'oauth_expired');
+    if (error?.status === 403) throw providerVerificationError('OpenAI Codex 拒绝了当前账号请求。', 403, 'provider_rejected');
+    throw providerVerificationError(error?.message || 'OpenAI Codex 模型目录刷新失败。', error?.status || 502, error?.code || 'catalog_refresh_failed');
+  }
+  const modelIds = catalog.modelIds || [];
+  if (!modelIds.includes(modelId)) {
+    throw providerVerificationError('当前 ChatGPT 账号不可用此模型。', 400, 'model_not_entitled');
+  }
+  return { verificationKind: 'codex_oauth', usageConsumed: false, catalog };
+}
+
+async function verifyClaudeOAuthProvider(profileName, modelId, baseUrl) {
+  const accessToken = oauthTokenForVerification(profileName, 'claude-oauth');
+  const url = process.env.FRAKIO_WORK_CLAUDE_VERIFY_URL || providerInferenceUrl({ baseUrl, apiMode: 'anthropic_messages' });
+  const result = await fetchExternalJson(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,claude-code-20250219,oauth-2025-04-20',
+      'User-Agent': 'claude-code/2.1.74 (external, cli)',
+      'x-app': 'cli',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8 }),
+    timeoutMs: 30000,
+  });
+  if (!result.ok) throwNativeVerificationFailure(result, 'Claude OAuth');
+  return { verificationKind: 'claude_oauth', usageConsumed: true };
+}
+
+function geminiClientMetadata(projectId = '') {
+  const platform = process.platform === 'darwin'
+    ? (process.arch === 'arm64' ? 'DARWIN_ARM64' : 'DARWIN_AMD64')
+    : process.platform === 'win32' ? 'WINDOWS_AMD64' : (process.arch === 'arm64' ? 'LINUX_ARM64' : 'LINUX_AMD64');
+  return { ideType: 'GEMINI_CLI', platform, pluginType: 'GEMINI', ...(projectId ? { duetProject: projectId } : {}) };
+}
+
+function savedGeminiCodeAssistState(profileName) {
+  const auth = loadAuthJsonSync(authJsonPathForProfile(profileName));
+  return auth.providers?.[geminiProviderKey]?.code_assist || {};
+}
+
+function saveGeminiCodeAssistState(profileName, metadata) {
+  const authPath = authJsonPathForProfile(profileName);
+  const auth = loadAuthJsonSync(authPath);
+  const provider = { ...(auth.providers?.[geminiProviderKey] || {}), code_assist: metadata };
+  auth.providers = { ...(auth.providers || {}), [geminiProviderKey]: provider };
+  const pool = Array.isArray(auth.credential_pool?.[geminiProviderKey]) ? auth.credential_pool[geminiProviderKey] : [];
+  auth.credential_pool = { ...(auth.credential_pool || {}), [geminiProviderKey]: pool.map((entry) => ({ ...entry, code_assist: metadata })) };
+  saveAuthJsonSync(authPath, auth);
+}
+
+async function geminiCodeAssistRequest(accessToken, method, body, timeoutMs = 30000) {
+  const base = String(process.env.FRAKIO_WORK_GEMINI_CODE_ASSIST_URL || 'https://cloudcode-pa.googleapis.com/v1internal').replace(/\/+$/, '');
+  return fetchExternalJson(`${base}:${method}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'User-Agent': 'GeminiCLI/Frakio-Work' },
+    body: JSON.stringify(body),
+    timeoutMs,
+  });
+}
+
+async function geminiCodeAssistOperation(accessToken, name) {
+  const base = String(process.env.FRAKIO_WORK_GEMINI_CODE_ASSIST_URL || 'https://cloudcode-pa.googleapis.com/v1internal').replace(/\/+$/, '');
+  return fetchExternalJson(`${base}/${String(name || '').replace(/^\/+/, '')}`, {
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'User-Agent': 'GeminiCLI/Frakio-Work' },
+    timeoutMs: 15000,
+  });
+}
+
+async function resolveGeminiCodeAssistAccount(profileName, accessToken) {
+  const saved = savedGeminiCodeAssistState(profileName);
+  const requestedProject = String(saved.projectId || '').trim();
+  const load = await geminiCodeAssistRequest(accessToken, 'loadCodeAssist', {
+    ...(requestedProject ? { cloudaicompanionProject: requestedProject } : {}),
+    metadata: geminiClientMetadata(requestedProject),
+  });
+  if (!load.ok) throwNativeVerificationFailure(load, 'Google Gemini OAuth');
+  const payload = load.body || {};
+  if (payload.currentTier) {
+    const projectId = String(payload.cloudaicompanionProject || requestedProject || '').trim();
+    if (!projectId) throw providerVerificationError('Google Gemini OAuth 账号尚未完成 Code Assist 初始化。', 400, 'oauth_setup_required');
+    return { projectId, tierId: String(payload.paidTier?.id || payload.currentTier?.id || 'standard-tier'), tierName: String(payload.paidTier?.name || payload.currentTier?.name || '') };
+  }
+  const tier = (Array.isArray(payload.allowedTiers) ? payload.allowedTiers : []).find((item) => item?.isDefault)
+    || (Array.isArray(payload.allowedTiers) ? payload.allowedTiers[0] : null);
+  if (!tier?.id) throw providerVerificationError('Google Gemini OAuth 账号当前不能启用 Code Assist。', 400, 'oauth_setup_required');
+  if (tier.userDefinedCloudaicompanionProject && !requestedProject) {
+    throw providerVerificationError('Google Gemini OAuth 需要先配置 Google Cloud Project。', 400, 'oauth_setup_required');
+  }
+  let onboard = await geminiCodeAssistRequest(accessToken, 'onboardUser', {
+    tierId: tier.id,
+    ...(tier.userDefinedCloudaicompanionProject ? { cloudaicompanionProject: requestedProject } : {}),
+    metadata: geminiClientMetadata(requestedProject),
+  });
+  if (!onboard.ok) throwNativeVerificationFailure(onboard, 'Google Gemini OAuth');
+  for (let attempt = 0; !onboard.body?.done && onboard.body?.name && attempt < 6; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    onboard = await geminiCodeAssistOperation(accessToken, onboard.body.name);
+    if (!onboard.ok) throwNativeVerificationFailure(onboard, 'Google Gemini OAuth');
+  }
+  if (!onboard.body?.done) throw providerVerificationError('Google Gemini OAuth 正在初始化，请稍后重新验证。', 409, 'oauth_setup_required');
+  const projectId = String(onboard.body?.response?.cloudaicompanionProject?.id || requestedProject || '').trim();
+  if (!projectId) throw providerVerificationError('Google Gemini OAuth 没有返回可用的 Code Assist Project。', 400, 'oauth_setup_required');
+  return { projectId, tierId: String(tier.id), tierName: String(tier.name || '') };
+}
+
+async function verifyGeminiOAuthProvider(profileName, modelId) {
+  const accessToken = oauthTokenForVerification(profileName, geminiProviderKey);
+  const account = await resolveGeminiCodeAssistAccount(profileName, accessToken);
+  const result = await geminiCodeAssistRequest(accessToken, 'generateContent', {
+    model: modelId,
+    project: account.projectId,
+    user_prompt_id: randomUUID(),
+    request: {
+      contents: [{ role: 'user', parts: [{ text: 'Reply OK.' }] }],
+      generationConfig: { maxOutputTokens: 8 },
+      session_id: randomUUID(),
+    },
+  });
+  if (!result.ok) {
+    const message = providerErrorMessage(result, `HTTP ${result.status || 502}`);
+    if (result.status === 400 && /model|not found|unsupported/i.test(message)) {
+      throw providerVerificationError('当前 Google 账号不可用此模型。', 400, 'model_not_entitled');
+    }
+    throwNativeVerificationFailure(result, 'Google Gemini OAuth');
+  }
+  const verifiedAt = now();
+  saveGeminiCodeAssistState(profileName, { projectId: account.projectId, tierId: account.tierId, tierName: account.tierName, verifiedAt });
+  return { verificationKind: 'gemini_code_assist', usageConsumed: true, verifiedAt };
 }
 
 function readPlatformEnvAsConfig(envValues) {
@@ -7527,7 +7723,13 @@ app.get('/api/model-capabilities', async (_req, res) => {
 
 app.get('/api/model-providers/presets', async (req, res) => {
   const profile = await requestedModelProfile(req);
-  const providers = loadProviderPresets().filter((preset) => preset.selectable).map((preset) => {
+  const selectablePresets = loadProviderPresets().filter((preset) => preset.selectable);
+  const codexPreset = selectablePresets.find((preset) => preset.value === 'openai-codex');
+  if (codexPreset && oauthProviderAuthenticated(profile, codexPreset.value) && catalogStatus(modelCatalogCache, oauthCatalogModel(codexPreset.value)).stale) {
+    const accessToken = oauthProviderAccessToken(profile, codexPreset.value);
+    if (accessToken) await refreshCodexOAuthModels(accessToken).catch(() => {});
+  }
+  const providers = selectablePresets.map((preset) => {
     const { selectable: _selectable, ...publicPreset } = preset;
     if (!preset.authType) return { ...publicPreset, authenticated: false };
     const state = oauthProviderState(profile, preset.value);
@@ -7583,7 +7785,14 @@ async function refreshStaleProviderCatalogs() {
 
 app.post('/api/models/fetch', async (req, res) => {
   try {
-    const fetched = await fetchProviderModelsForRequest(req.body);
+    const state = await readState();
+    const savedModel = req.body?.modelId ? state.models.find((item) => item.id === req.body.modelId) : null;
+    if (req.body?.modelId && !savedModel) return res.status(404).json({ error: '模型不存在。' });
+    const requestedBaseUrl = String(req.body?.baseUrl || req.body?.base_url || '').trim();
+    const apiKey = savedModel
+      ? await credentialForModelDraft(savedModel, requestedBaseUrl, req.body?.apiKey || req.body?.api_key, state.models)
+      : String(req.body?.apiKey || req.body?.api_key || '').trim();
+    const fetched = await fetchProviderModelsForRequest({ ...req.body, apiKey });
     const models = fetched.models;
     const capabilityModel = normalizeModels([{
       id: 'fetched',
@@ -7628,27 +7837,127 @@ function providerInferenceUrl(model) {
   return /\/v1$/i.test(base) ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
 }
 
+function verificationModelFromRequest(savedModel, body = {}) {
+  const configuration = body?.configuration && typeof body.configuration === 'object' ? body.configuration : null;
+  const modelId = String(configuration?.model || body?.modelId || savedModel.model || '').trim().slice(0, 100);
+  if (!configuration) return { ...savedModel, model: modelId, models: normalizeModelNames(savedModel.models, modelId) };
+  const next = { ...savedModel, model: modelId, models: normalizeModelNames(savedModel.models, modelId) };
+  if ('name' in configuration) {
+    const name = String(configuration.name || '').trim();
+    if (!name) throw Object.assign(new Error('模型名称不能为空。'), { status: 400 });
+    next.name = name.slice(0, 60);
+  }
+  if ('provider' in configuration) next.provider = String(configuration.provider || 'Custom').trim().slice(0, 40);
+  if ('kind' in configuration && ['official', 'relay', 'local'].includes(configuration.kind)) next.kind = configuration.kind;
+  if ('models' in configuration) next.models = normalizeModelNames(configuration.models, modelId);
+  if ('baseUrl' in configuration) {
+    const baseUrl = String(configuration.baseUrl || '').trim().slice(0, 240);
+    try {
+      const parsed = new URL(baseUrl);
+      const isGeminiOAuthRoute = savedModel.providerKey === geminiProviderKey && baseUrl === 'cloudcode-pa://google';
+      if (!['http:', 'https:'].includes(parsed.protocol) && !isGeminiOAuthRoute) throw new Error('unsupported protocol');
+    } catch {
+      throw Object.assign(new Error('Base URL 格式不正确。'), { status: 400 });
+    }
+    next.baseUrl = baseUrl;
+  }
+  if ('apiMode' in configuration) {
+    const apiMode = normalizeApiMode(configuration.apiMode);
+    if (!apiMode) throw Object.assign(new Error('API 协议不受支持。'), { status: 400 });
+    next.apiMode = apiMode;
+    next.protocol = modelProtocolFromApiMode(apiMode);
+  }
+  if ('modelApiModes' in configuration) next.modelApiModes = normalizeModelApiModes(configuration.modelApiModes);
+  if ('compat' in configuration) next.compat = normalizeModelCompat(configuration.compat);
+  if ('modelCompat' in configuration) next.modelCompat = normalizeModelCompatMap(configuration.modelCompat);
+  if ('modelsUrl' in configuration) next.modelsUrl = String(configuration.modelsUrl || '').trim().slice(0, 300);
+  if ('contextLimit' in configuration) next.contextLimit = Number.isFinite(Number(configuration.contextLimit)) && Number(configuration.contextLimit) > 0 ? Number(configuration.contextLimit) : null;
+  if ('pricing' in configuration) next.pricing = normalizeModelPricing(configuration.pricing);
+  if ('capabilityMode' in configuration) next.capabilityMode = configuration.capabilityMode === 'manual' ? 'manual' : 'auto';
+  if ('capabilityOverrides' in configuration) next.capabilityOverrides = normalizeCapabilityOverrides(configuration.capabilityOverrides);
+  return next;
+}
+
+async function persistVerifiedModelDraft(state, savedModel, verifiedModel, explicitApiKey) {
+  for (const key of ['name', 'provider', 'kind', 'protocol', 'model', 'models', 'baseUrl', 'apiMode', 'modelsUrl', 'modelApiModes', 'compat', 'modelCompat', 'contextLimit', 'capabilityMode', 'capabilityOverrides', 'pricing']) {
+    savedModel[key] = verifiedModel[key];
+  }
+  const provided = String(explicitApiKey || '').trim();
+  if (provided) {
+    savedModel.apiKeyState = 'provided';
+    await setModelSecret(savedModel.id, provided);
+  }
+  savedModel.apiKey = '';
+  await writeState(state);
+}
+
 app.post('/api/models/:id/verify', async (req, res) => {
   let verificationContext = null;
   try {
     const state = await readState();
     const model = state.models.find((item) => item.id === req.params.id);
     if (!model) return res.status(404).json({ error: '模型不存在。' });
-    const modelId = String(req.body?.modelId || model.model || '').trim();
-    verificationContext = { model, modelId };
-    const capability = resolveModelCapability(model, modelId, { providerCatalog: flattenProviderCatalog(modelCatalogCache) });
-    const apiKey = String(req.body?.apiKey || '').trim() || await getReusableModelSecret(model, state.models);
-    if (!apiKey && !oauthProviderKeys.has(model.providerKey)) return res.status(400).json({ error: '验证需要可用的 API Key。' });
-    const headers = model.apiMode === 'anthropic_messages'
+    const savedRoutePrefix = verificationRoutePrefix(model);
+    const verificationModel = verificationModelFromRequest(model, req.body);
+    const modelId = verificationModel.model;
+    verificationContext = { model: verificationModel, modelId, recordFailure: !oauthProviderKeys.has(model.providerKey) };
+    const capability = resolveModelCapability(verificationModel, modelId, { providerCatalog: flattenProviderCatalog(modelCatalogCache) });
+    const saveOnSuccess = req.body?.saveOnSuccess === true && Boolean(req.body?.configuration);
+    if (oauthProviderKeys.has(model.providerKey)) {
+      const profileName = model.profileName || await requestedModelProfile(req);
+      const officialBaseUrl = officialOAuthBaseUrl(model.providerKey, verificationModel.baseUrl);
+      let nativeVerification;
+      if (model.providerKey === 'openai-codex') nativeVerification = await verifyCodexOAuthProvider(profileName, modelId);
+      else if (model.providerKey === 'claude-oauth') nativeVerification = await verifyClaudeOAuthProvider(profileName, modelId, officialBaseUrl);
+      else if (model.providerKey === geminiProviderKey) nativeVerification = await verifyGeminiOAuthProvider(profileName, modelId);
+      else throw providerVerificationError('当前 OAuth Provider 暂不支持原生验证。', 400, 'provider_rejected');
+      if (saveOnSuccess) {
+        await persistVerifiedModelDraft(state, model, verificationModel, '');
+        await updateHermesModelProviderConfig(profileName, model.providerKey, model.model);
+        const verifiedRoutePrefix = verificationRoutePrefix(verificationModel);
+        if (savedRoutePrefix !== verifiedRoutePrefix) {
+          modelCatalogCache.verifications = Object.fromEntries(Object.entries(modelCatalogCache.verifications || {}).filter(([key]) => !key.startsWith(savedRoutePrefix)));
+        }
+      }
+      const verifiedAt = nativeVerification.verifiedAt || now();
+      modelCatalogCache.verifications = modelCatalogCache.verifications || {};
+      modelCatalogCache.verifications[verificationKey(verificationModel, modelId)] = {
+        status: 'confirmed', modelId, verifiedAt,
+        reasoning: capability.defaultReasoning || 'default',
+        serviceTier: capability.serviceTiers?.[0]?.id || 'standard',
+        verificationKind: nativeVerification.verificationKind,
+      };
+      await writeCatalogCache(modelCatalogCachePath, modelCatalogCache);
+      return res.json({
+        verified: true, mode: 'connection', modelId,
+        requestedReasoning: capability.defaultReasoning || 'default', effectiveReasoning: capability.defaultReasoning || 'default',
+        requestedServiceTier: capability.serviceTiers?.[0]?.id || 'standard', effectiveServiceTier: capability.serviceTiers?.[0]?.id || 'standard',
+        capabilitySource: capability.source, capability, probeResults: [], verifiedAt,
+        verificationKind: nativeVerification.verificationKind, usageConsumed: nativeVerification.usageConsumed,
+        ...(nativeVerification.catalog ? { catalog: nativeVerification.catalog } : {}),
+        saved: saveOnSuccess,
+        ...(saveOnSuccess ? { model: publicModel(model), models: state.models.map(publicModel) } : {}),
+      });
+    }
+    const apiKey = await credentialForModelDraft(model, verificationModel.baseUrl, req.body?.apiKey, state.models);
+    if (!apiKey) return res.status(400).json({ error: '验证需要可用的 API Key。' });
+    const headers = verificationModel.apiMode === 'anthropic_messages'
       ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }
       : { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
     const mode = req.body?.mode === 'discover' ? 'discover' : 'connection';
-    const canDiscover = model.capabilityMode !== 'manual'
-      && String(model.providerKey || '').startsWith('custom:')
-      && (model.apiMode === 'codex_responses' || model.apiMode === 'openai_responses')
+    const canDiscover = verificationModel.capabilityMode !== 'manual'
+      && String(verificationModel.providerKey || '').startsWith('custom:')
+      && (verificationModel.apiMode === 'codex_responses' || verificationModel.apiMode === 'openai_responses')
       && ['unknown', 'verification_failed'].includes(capability.status);
     if (mode === 'discover' && !canDiscover) {
-      return res.status(400).json({ error: '当前 Provider 不适合自动探测；请使用现有目录能力或手动能力设置。' });
+      const reason = verificationModel.capabilityMode === 'manual'
+        ? '当前使用手动能力设置。'
+        : !String(verificationModel.providerKey || '').startsWith('custom:')
+          ? '只有自定义中转站支持主动探测。'
+          : !['codex_responses', 'openai_responses'].includes(verificationModel.apiMode)
+            ? '主动探测需要 OpenAI Responses 或 OpenAI Codex Responses 协议。'
+            : '当前线路已有明确能力记录。';
+      return res.status(400).json({ error: reason });
     }
 
     if (mode === 'discover') {
@@ -7656,15 +7965,22 @@ app.post('/api/models/:id/verify', async (req, res) => {
         modelId,
         request: async (body) => {
           try {
-            return await fetchExternalJson(providerInferenceUrl(model), { method: 'POST', headers, body: JSON.stringify(body), timeoutMs: 12000 });
+            return await fetchExternalJson(providerInferenceUrl(verificationModel), { method: 'POST', headers, body: JSON.stringify(body), timeoutMs: 12000 });
           } catch (error) {
             return { ok: false, status: 0, error: String(error?.name === 'AbortError' ? '请求超时' : error?.message || error) };
           }
         },
       });
-      await recordActiveProbeCapability(modelCatalogCachePath, modelCatalogCache, model, discovery.capability);
+      if (saveOnSuccess) {
+        await persistVerifiedModelDraft(state, model, verificationModel, req.body?.apiKey);
+        const verifiedRoutePrefix = verificationRoutePrefix(verificationModel);
+        if (savedRoutePrefix !== verifiedRoutePrefix) {
+          modelCatalogCache.verifications = Object.fromEntries(Object.entries(modelCatalogCache.verifications || {}).filter(([key]) => !key.startsWith(savedRoutePrefix)));
+        }
+      }
+      await recordActiveProbeCapability(modelCatalogCachePath, modelCatalogCache, verificationModel, discovery.capability);
       modelCatalogCache.verifications = modelCatalogCache.verifications || {};
-      modelCatalogCache.verifications[verificationKey(model, modelId)] = {
+      modelCatalogCache.verifications[verificationKey(verificationModel, modelId)] = {
         status: 'confirmed', modelId, verifiedAt: discovery.verifiedAt,
         reasoning: discovery.capability.defaultReasoning || 'default',
         serviceTier: discovery.capability.serviceTiers[0]?.id || 'standard',
@@ -7679,33 +7995,44 @@ app.post('/api/models/:id/verify', async (req, res) => {
         capability: discovery.capability,
         probeResults: discovery.probeResults,
         verifiedAt: discovery.verifiedAt,
+        verificationKind: 'api_key',
+        usageConsumed: true,
+        saved: saveOnSuccess,
+        ...(saveOnSuccess ? { model: publicModel(model), models: state.models.map(publicModel) } : {}),
       });
     }
 
-    const mapped = mapRunSettings(model, capability, { reasoningEffort: req.body?.reasoningEffort, serviceTier: req.body?.serviceTier || req.body?.speedMode });
+    const mapped = mapRunSettings(verificationModel, capability, { reasoningEffort: req.body?.reasoningEffort, serviceTier: req.body?.serviceTier || req.body?.speedMode });
     const requestOverrides = mapped.runtimeOverrides.request_overrides || {};
     let body;
-    if (model.apiMode === 'anthropic_messages') body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...requestOverrides };
-    else if (model.apiMode === 'codex_responses' || model.apiMode === 'openai_responses') body = { model: modelId, input: 'Reply OK.', max_output_tokens: 8, ...(mapped.runtimeOverrides.reasoning_config ? { reasoning: mapped.runtimeOverrides.reasoning_config } : {}), ...(mapped.runtimeOverrides.service_tier ? { service_tier: mapped.runtimeOverrides.service_tier } : {}), ...requestOverrides };
+    if (verificationModel.apiMode === 'anthropic_messages') body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...requestOverrides };
+    else if (verificationModel.apiMode === 'codex_responses' || verificationModel.apiMode === 'openai_responses') body = { model: modelId, input: 'Reply OK.', max_output_tokens: 8, ...(mapped.runtimeOverrides.reasoning_config ? { reasoning: mapped.runtimeOverrides.reasoning_config } : {}), ...(mapped.runtimeOverrides.service_tier ? { service_tier: mapped.runtimeOverrides.service_tier } : {}), ...requestOverrides };
     else body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...requestOverrides };
-    const result = await fetchExternalJson(providerInferenceUrl(model), { method: 'POST', headers, body: JSON.stringify(body), timeoutMs: 30000 });
+    const result = await fetchExternalJson(providerInferenceUrl(verificationModel), { method: 'POST', headers, body: JSON.stringify(body), timeoutMs: 30000 });
     if (!result.ok) {
       const message = String(result.body?.error?.message || `HTTP ${result.status}`).slice(0, 500);
-      throw Object.assign(new Error(`配置验证失败：${message}`), { status: result.status || 502 });
+      throw Object.assign(new Error(`配置验证失败：${message}`), { status: result.status || 502, code: 'provider_rejected' });
     }
     modelCatalogCache.verifications = modelCatalogCache.verifications || {};
-    const key = verificationKey(model, modelId);
+    if (saveOnSuccess) {
+      await persistVerifiedModelDraft(state, model, verificationModel, req.body?.apiKey);
+      const verifiedRoutePrefix = verificationRoutePrefix(verificationModel);
+      if (savedRoutePrefix !== verifiedRoutePrefix) {
+        modelCatalogCache.verifications = Object.fromEntries(Object.entries(modelCatalogCache.verifications || {}).filter(([key]) => !key.startsWith(savedRoutePrefix)));
+      }
+    }
+    const key = verificationKey(verificationModel, modelId);
     const verifiedAt = now();
     modelCatalogCache.verifications[key] = { status: 'confirmed', modelId, verifiedAt, reasoning: mapped.effectiveReasoning, serviceTier: mapped.effectiveServiceTier };
     await writeCatalogCache(modelCatalogCachePath, modelCatalogCache);
-    res.json({ verified: true, mode, modelId, requestedReasoning: mapped.requestedReasoning, effectiveReasoning: mapped.effectiveReasoning, requestedServiceTier: mapped.requestedServiceTier, effectiveServiceTier: mapped.effectiveServiceTier, capabilitySource: capability.source, capability, probeResults: [], verifiedAt });
+    res.json({ verified: true, mode, modelId, requestedReasoning: mapped.requestedReasoning, effectiveReasoning: mapped.effectiveReasoning, requestedServiceTier: mapped.requestedServiceTier, effectiveServiceTier: mapped.effectiveServiceTier, capabilitySource: capability.source, capability, probeResults: [], verifiedAt, verificationKind: 'api_key', usageConsumed: true, saved: saveOnSuccess, ...(saveOnSuccess ? { model: publicModel(model), models: state.models.map(publicModel) } : {}) });
   } catch (error) {
-    if (verificationContext) {
+    if (verificationContext?.recordFailure) {
       modelCatalogCache.verifications = modelCatalogCache.verifications || {};
       modelCatalogCache.verifications[verificationKey(verificationContext.model, verificationContext.modelId)] = { status: 'verification_failed', modelId: verificationContext.modelId, verifiedAt: now(), error: String(error.message || error).slice(0, 500) };
       await writeCatalogCache(modelCatalogCachePath, modelCatalogCache).catch(() => {});
     }
-    res.status(error.status || 500).json({ error: error.message || '配置验证失败。' });
+    res.status(error.status || 500).json({ error: error.message || '配置验证失败。', ...(error.code ? { code: error.code } : {}) });
   }
 });
 
@@ -8083,6 +8410,7 @@ app.patch('/api/models/:id', async (req, res) => {
   const state = await readState();
   const model = state.models.find((item) => item.id === req.params.id);
   if (!model) return res.status(404).json({ error: '模型不存在。' });
+  const previousVerificationPrefix = verificationRoutePrefix(model);
   if ('name' in req.body) {
     const name = String(req.body.name || '').trim();
     if (!name) return res.status(400).json({ error: '模型名称不能为空。' });
@@ -8122,7 +8450,9 @@ app.patch('/api/models/:id', async (req, res) => {
   if (oauthProviderKeys.has(model.providerKey) && model.model) {
     await updateHermesModelProviderConfig(model.profileName || await requestedModelProfile(req), model.providerKey, model.model);
   }
-  modelCatalogCache.verifications = {};
+  const nextVerificationPrefix = verificationRoutePrefix(model);
+  modelCatalogCache.verifications = Object.fromEntries(Object.entries(modelCatalogCache.verifications || {})
+    .filter(([key]) => !key.startsWith(previousVerificationPrefix) && !key.startsWith(nextVerificationPrefix)));
   await writeCatalogCache(modelCatalogCachePath, modelCatalogCache).catch(() => {});
   res.json({ model: publicModel(model), models: state.models.map(publicModel) });
 });

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-export const CATALOG_VERSION = '2026-07-21.1';
+export const CATALOG_VERSION = '2026-07-22.1';
 export const REASONING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 export const CHAT_THINKING_FORMATS = ['openai', 'openrouter', 'deepseek', 'together', 'zai', 'qwen', 'chat_template', 'string_thinking'];
 export const PROTECTED_OVERRIDE_KEYS = new Set([
@@ -79,7 +79,7 @@ const builtinEntries = [
 export const BUILTIN_CATALOG = Object.freeze(Object.fromEntries(builtinEntries));
 export const BUILTIN_CATALOG_META = Object.freeze({
   version: CATALOG_VERSION,
-  generatedAt: '2026-07-21T00:00:00.000Z',
+  generatedAt: '2026-07-22T00:00:00.000Z',
   hash: createHash('sha256').update(JSON.stringify(builtinEntries)).digest('hex'),
 });
 
@@ -154,6 +154,24 @@ function exactBuiltin(model, modelId) {
   return BUILTIN_CATALOG[catalogKey(model, modelId)] || null;
 }
 
+function mergeCapabilityFields(primaryRaw, fallbackRaw, modelId, source) {
+  const primary = normalizeCapabilityRecord(primaryRaw, modelId, { source });
+  if (!fallbackRaw) return primary;
+  const fallback = normalizeCapabilityRecord(fallbackRaw, modelId);
+  const useFallbackReasoning = primary.reasoningStatus === 'unknown';
+  const useFallbackServiceTiers = primary.serviceTierStatus === 'unknown';
+  return normalizeCapabilityRecord({
+    ...fallback,
+    ...primary,
+    defaultReasoning: primary.defaultReasoning || (useFallbackReasoning ? fallback.defaultReasoning : ''),
+    reasoningMap: useFallbackReasoning ? fallback.reasoningMap : primary.reasoningMap,
+    serviceTiers: useFallbackServiceTiers ? fallback.serviceTiers : primary.serviceTiers,
+    reasoningStatus: useFallbackReasoning ? fallback.reasoningStatus : primary.reasoningStatus,
+    serviceTierStatus: useFallbackServiceTiers ? fallback.serviceTierStatus : primary.serviceTierStatus,
+    source: primary.source,
+  }, modelId);
+}
+
 function manualRecord(model, modelId) {
   if (model?.capabilityMode !== 'manual') return null;
   const raw = model?.capabilityOverrides?.[modelId] || model?.capabilityOverrides?.['*'];
@@ -171,10 +189,11 @@ export function resolveCapability(model, modelId, sources = {}) {
   const rich = sources.providerCatalog?.[key];
   const routeBaseUrl = clean(model?.baseUrl).replace(/\/+$/, '').toLowerCase();
   const routeMatches = rich?.source !== 'active_probe' || clean(rich?.routeBaseUrl).replace(/\/+$/, '').toLowerCase() === routeBaseUrl;
-  if (rich && routeMatches) return normalizeCapabilityRecord(rich, id, { source: 'provider_catalog' });
   const runtime = sources.runtimeCatalog?.[key];
-  if (runtime) return normalizeCapabilityRecord(runtime, id, { source: 'hermes_runtime' });
   const builtin = exactBuiltin(model, id);
+  const runtimeWithFallback = runtime ? mergeCapabilityFields(runtime, builtin, id, 'hermes_runtime') : builtin;
+  if (rich && routeMatches) return mergeCapabilityFields(rich, runtimeWithFallback, id, rich.source || 'provider_catalog');
+  if (runtime) return normalizeCapabilityRecord(runtimeWithFallback, id, { source: 'hermes_runtime' });
   if (builtin) return normalizeCapabilityRecord(builtin, id);
   return emptyCapability(id);
 }

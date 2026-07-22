@@ -2,6 +2,18 @@
 
 ## 0.1.4 Beta — 2026-07-22
 
+### 0.1.4 后续修订
+
+本次继续使用 0.1.4 版本号，并重新生成 Apple Silicon 与 Intel 下载资产。修订集中处理首个 0.1.4 发布后发现的 Provider 配置与桌面交互问题；此前下载的 0.1.4 安装包与本次修订包的摘要不同。
+
+Provider 验证现在以弹窗中的完整草稿为准。切换 API 协议、Base URL、默认模型或能力设置后，“验证并保存”会使用最新配置连接线路，成功后一次性覆盖原配置，失败时保留原来的可用配置。已有 Provider 的 API Key 可以在相同 HTTPS Origin 下直接复用于获取模型和验证；只切换 Chat Completions、Responses 或 Codex Responses 协议时不需要重新输入密钥。更换域名、协议或端口后必须提供新密钥，旧密钥不会发送到新地址。弹窗同时增加未保存更改与未验证连接参数的确认，减少误覆盖。
+
+OpenAI Codex、Claude OAuth 和 Google Gemini OAuth 改用各自的原生验证路径。Codex 使用当前 Hermes Profile 的 OAuth Token、ChatGPT Account ID 和账号模型目录完成无额外推理消耗的授权验证；Claude OAuth 使用 Bearer Token 与 OAuth 专用请求头；Gemini OAuth 使用 Google Code Assist 的账号与模型调用流程。验证失败不会清除已成功获取的目录、授权状态或原 Provider 配置，也不会再把 OAuth 凭据误当成普通 API Key。
+
+修复官方 Codex 模型目录中推理档位采用对象结构时无法识别的问题。现在会读取每个档位对象的 `effort`，保留账号目录返回的顺序、默认档位和服务层信息；`gpt-5.6-sol` 等模型会按当前账号实际目录显示可用推理强度。能力合并改为逐字段补齐，Provider 明确声明的限制仍然优先。模型能力缓存版本同步升级，旧版保存的空推理映射会自动失效并重新解析。
+
+Provider 添加、编辑及 OAuth 授权弹窗的关闭按钮明确脱离 Electron 窗口拖拽区域。桌面端完整点击范围为 40 × 40px，窄屏为 44 × 44px，按钮中心、边缘和四角都能正常响应；持久模态、未保存更改确认和底层窗口拖拽行为保持不变。
+
 ### 工作台与 Agent 创建
 
 新安装现在以完全空白的工作台开始，不再自动创建示例 Agent、模型、欢迎对话或知识库。旧安装升级时会先备份 state，只清理仍与历史内置内容完全一致的演示数据；用户创建、编辑、同步、引用或配置过密钥的内容不会被删除。本地 Hermes Profile 只有在用户主动点击“同步本地 Hermes 设置”后才会导入。

@@ -7076,6 +7076,35 @@ button:disabled { cursor: not-allowed; opacity: .58; }
   width: min(520px, calc(100vw - 32px));
   max-height: min(780px, calc(100dvh - 40px));
 }
+.provider-editor > .modal-head,
+.auth-modal > .modal-head {
+  position: relative;
+  z-index: 2;
+  isolation: isolate;
+}
+.provider-modal-close {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 40px;
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  min-height: 40px;
+  padding: 0;
+  pointer-events: auto;
+  touch-action: manipulation;
+  -webkit-app-region: no-drag;
+}
+.provider-modal-close svg {
+  pointer-events: none;
+}
+.provider-unsaved {
+  display: block;
+  margin-top: 3px;
+  color: #8a6a24;
+  font-size: 11px;
+  font-weight: 600;
+}
 .agent-editor-body {
   display: grid;
   gap: 12px;
@@ -8989,6 +9018,14 @@ textarea:focus-visible {
     rgb(17 24 39 / 22%);
 }
 
+.modal-backdrop,
+.modal-backdrop .modal,
+.modal-backdrop .modal *,
+.profile-edit-modal,
+.profile-edit-modal * {
+  -webkit-app-region: no-drag;
+}
+
 .modal,
 .profile-edit-modal .profile-edit-card,
 .agent-editor,
@@ -10133,6 +10170,14 @@ textarea:focus-visible {
 
   .provider-modal-footer {
     padding: 12px 18px 16px;
+  }
+
+  .provider-modal-close {
+    flex-basis: 44px;
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    min-height: 44px;
   }
 
   .modal-head {

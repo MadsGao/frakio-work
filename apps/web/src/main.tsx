@@ -119,7 +119,9 @@ type CatalogInfo = { source: string; rich: boolean; modelIds?: string[]; url?: s
 type ModelPayload = { name: string; provider: string; kind: ModelKind; protocol: ModelProtocol; model: string; models: string[]; baseUrl: string; apiKey: string; pricing: ModelPricing; providerKey?: string; apiMode?: ProviderApiMode; modelsUrl?: string; modelApiModes?: Record<string, ProviderApiMode>; compat?: ModelCompat; modelCompat?: Record<string, ModelCompat>; contextLimit?: number | null; capabilityMode: 'auto' | 'manual'; capabilityOverrides: Record<string, ModelCapabilityOverride> };
 type ModelProfile = Omit<ModelPayload, 'apiKey'> & { id: string; hasApiKey: boolean; source?: 'demo' | 'hermes-studio' | 'hermes-profile' | 'manual'; profileName?: string; providerKey?: string; apiMode?: ProviderApiMode; contextLimit?: number | null };
 type ModelFetchResult = { models: string[]; capabilities: Record<string, ModelCapability>; catalog?: CatalogInfo };
-type FetchAvailableModels = (baseUrl: string, apiKey: string, context?: Partial<ModelPayload>) => Promise<ModelFetchResult>;
+type ModelFetchContext = Partial<ModelPayload> & { modelId?: string };
+type FetchAvailableModels = (baseUrl: string, apiKey: string, context?: ModelFetchContext) => Promise<ModelFetchResult>;
+type SaveModel = (payload: ModelPayload, modelId?: string, persistedModels?: ModelProfile[]) => Promise<boolean>;
 type ProviderPreset = { label: string; value: string; baseUrl: string; models: string[]; builtin: boolean; apiMode?: ProviderApiMode; authType?: ProviderAuthType; authenticated?: boolean; catalog?: CatalogInfo };
 const compatibilityRelayProviderKeys = new Set(['ikuncode', 'fun-codex', 'fun-claude']);
 type OAuthProviderState = 'unauthenticated' | 'authorizing' | 'authorized_loading_catalog' | 'ready' | 'catalog_error';
@@ -2957,8 +2959,14 @@ function App() {
     }
   }
 
-  async function saveModel(payload: ModelPayload, modelId?: string) {
+  async function saveModel(payload: ModelPayload, modelId?: string, persistedModels?: ModelProfile[]) {
     setModelError('');
+    if (persistedModels) {
+      setModels(persistedModels);
+      const capabilityData = await fetch('/api/model-capabilities').then((response) => response.json()).catch(() => null);
+      if (capabilityData?.capabilities) setModelCapabilities(capabilityData.capabilities);
+      return true;
+    }
     const res = await fetch(modelId ? `/api/models/${modelId}` : '/api/models', {
       method: modelId ? 'PATCH' : 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2988,7 +2996,7 @@ function App() {
     return true;
   }
 
-  async function fetchAvailableModels(baseUrl: string, apiKey: string, context: Partial<ModelPayload> = {}) {
+  async function fetchAvailableModels(baseUrl: string, apiKey: string, context: ModelFetchContext = {}) {
     const res = await fetch('/api/models/fetch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -7291,7 +7299,7 @@ function SettingsPage({ vaults, models, agents, hermesStatus, hermesBootstrap, h
   pinnedNav: PinnedNav;
   onTogglePinned: (id: string) => void;
   modelError: string;
-  saveModel: (payload: ModelPayload, modelId?: string) => Promise<boolean>;
+  saveModel: SaveModel;
   deleteModel: (modelId: string) => Promise<boolean>;
   fetchAvailableModels: FetchAvailableModels;
   onCapabilityChanged: (modelId: string, modelName: string, capability: ModelCapability) => void;
@@ -8129,7 +8137,7 @@ function CombinationModelsPanel({ profile, groups }: { profile: string; groups: 
   </section>;
 }
 
-function ModelConfigPage({ models, profiles, defaultProfile, modelError, saveModel, deleteModel, fetchAvailableModels, onCapabilityChanged }: { models: ModelProfile[]; profiles: HermesProfile[]; defaultProfile: string; modelError: string; saveModel: (payload: ModelPayload, modelId?: string) => Promise<boolean>; deleteModel: (modelId: string) => Promise<boolean>; fetchAvailableModels: FetchAvailableModels; onCapabilityChanged: (modelId: string, modelName: string, capability: ModelCapability) => void }) {
+function ModelConfigPage({ models, profiles, defaultProfile, modelError, saveModel, deleteModel, fetchAvailableModels, onCapabilityChanged }: { models: ModelProfile[]; profiles: HermesProfile[]; defaultProfile: string; modelError: string; saveModel: SaveModel; deleteModel: (modelId: string) => Promise<boolean>; fetchAvailableModels: FetchAvailableModels; onCapabilityChanged: (modelId: string, modelName: string, capability: ModelCapability) => void }) {
   return (
     <section className="settings-page">
       <ModelCenter models={models} profiles={profiles} defaultProfile={defaultProfile} modelError={modelError} saveModel={saveModel} deleteModel={deleteModel} fetchAvailableModels={fetchAvailableModels} onCapabilityChanged={onCapabilityChanged} />
@@ -8137,19 +8145,20 @@ function ModelConfigPage({ models, profiles, defaultProfile, modelError, saveMod
   );
 }
 
-function ModelCenter({ models, profiles, defaultProfile, modelError, saveModel, deleteModel, fetchAvailableModels, onCapabilityChanged }: { models: ModelProfile[]; profiles: HermesProfile[]; defaultProfile: string; modelError: string; saveModel: (payload: ModelPayload, modelId?: string) => Promise<boolean>; deleteModel: (modelId: string) => Promise<boolean>; fetchAvailableModels: FetchAvailableModels; onCapabilityChanged: (modelId: string, modelName: string, capability: ModelCapability) => void }) {
+function ModelCenter({ models, profiles, defaultProfile, modelError, saveModel, deleteModel, fetchAvailableModels, onCapabilityChanged }: { models: ModelProfile[]; profiles: HermesProfile[]; defaultProfile: string; modelError: string; saveModel: SaveModel; deleteModel: (modelId: string) => Promise<boolean>; fetchAvailableModels: FetchAvailableModels; onCapabilityChanged: (modelId: string, modelName: string, capability: ModelCapability) => void }) {
   const [activeTab, setActiveTab] = useState<'general' | 'auxiliary' | 'combination'>('general');
   const [profile, setProfile] = useState(defaultProfile || profiles[0]?.name || 'default');
   const [editingModel, setEditingModel] = useState<ModelProfile | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const slotGroups = useModelSlotGroups(models);
   useEffect(() => { if (!profiles.some((item) => item.name === profile)) setProfile(defaultProfile || profiles[0]?.name || 'default'); }, [profiles.map((item) => item.name).join(','), defaultProfile]);
-  async function handleSave(payload: ModelPayload) {
-    const ok = await saveModel(payload, editingModel?.id);
-    if (ok) {
+  async function handleSave(payload: ModelPayload, options: { close?: boolean; persistedModels?: ModelProfile[] } = {}) {
+    const ok = await saveModel(payload, editingModel?.id, options.persistedModels);
+    if (ok && options.close !== false) {
       setModalOpen(false);
       setEditingModel(null);
     }
+    return ok;
   }
   async function handleDelete(model: ModelProfile) {
     const okToDelete = window.confirm(`删除模型「${model.name}」？`);
@@ -8193,10 +8202,26 @@ function ModelCenter({ models, profiles, defaultProfile, modelError, saveModel, 
   );
 }
 
-function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapabilityChanged }: { model: ModelProfile | null; onClose: () => void; onSave: (payload: ModelPayload) => Promise<void>; fetchAvailableModels: FetchAvailableModels; onCapabilityChanged: (modelId: string, modelName: string, capability: ModelCapability) => void }) {
+function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapabilityChanged }: { model: ModelProfile | null; onClose: () => void; onSave: (payload: ModelPayload, options?: { close?: boolean; persistedModels?: ModelProfile[] }) => Promise<boolean>; fetchAvailableModels: FetchAvailableModels; onCapabilityChanged: (modelId: string, modelName: string, capability: ModelCapability) => void }) {
   const emptyPricing: ModelPricing = { input: null, output: null, cacheRead: null, cacheCreation: null };
   const titleId = useId();
   const providerTypeForModel = (value: ModelProfile | null): 'preset' | 'custom' => value && (!value.providerKey || value.providerKey.startsWith('custom:') || compatibilityRelayProviderKeys.has(value.providerKey)) ? 'custom' : 'preset';
+  const draftForModel = (value: ModelProfile | null): ModelPayload => ({
+    name: value?.name || '', provider: value?.provider || '', kind: value?.kind || 'official', protocol: value?.protocol || 'OpenAI Compatible',
+    model: value?.model || '', models: value?.models?.length ? value.models : [value?.model || ''].filter(Boolean), baseUrl: value?.baseUrl || '', apiKey: '',
+    providerKey: value?.providerKey || '', apiMode: value?.apiMode || 'chat_completions', modelsUrl: value?.modelsUrl || '', modelApiModes: value?.modelApiModes || {},
+    compat: value?.compat || { thinkingFormat: 'openai', requestOverrides: {} }, modelCompat: value?.modelCompat || {}, contextLimit: value?.contextLimit || null,
+    pricing: value?.pricing || emptyPricing, capabilityMode: value?.capabilityMode || 'auto', capabilityOverrides: value?.capabilityOverrides || {},
+  });
+  const secureOrigin = (value: string) => {
+    try { const url = new URL(value); return url.protocol === 'https:' ? url.origin.toLowerCase() : ''; } catch { return ''; }
+  };
+  const comparableDraft = (value: ModelPayload) => JSON.stringify({ ...value, apiKey: value.apiKey || '' });
+  const connectionSignature = (value: ModelPayload) => JSON.stringify({
+    baseUrl: value.baseUrl.trim().replace(/\/+$/, '').toLowerCase(), apiMode: value.apiMode || '', model: value.model,
+    modelApiModes: value.modelApiModes || {}, capabilityMode: value.capabilityMode, capabilityOverrides: value.capabilityOverrides || {},
+    compat: value.compat || {}, modelCompat: value.modelCompat || {}, apiKey: value.apiKey || '',
+  });
   const [providerType, setProviderType] = useState<'preset' | 'custom'>(model ? providerTypeForModel(model) : 'preset');
   const [presets, setPresets] = useState<ProviderPreset[]>([]);
   const [selectedPreset, setSelectedPreset] = useState(model?.providerKey || '');
@@ -8205,22 +8230,8 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
   const [authType, setAuthType] = useState<ProviderAuthType | null>(null);
   const [authorizedProviders, setAuthorizedProviders] = useState<Record<string, boolean>>({});
   const [oauthState, setOauthState] = useState<OAuthProviderState>('unauthenticated');
-  const [draft, setDraft] = useState<ModelPayload>({
-    name: model?.name || '',
-    provider: model?.provider || '',
-    kind: model?.kind || 'official',
-    protocol: model?.protocol || 'OpenAI Compatible',
-    model: model?.model || '',
-    models: model?.models?.length ? model.models : [model?.model || ''].filter(Boolean),
-    baseUrl: model?.baseUrl || '',
-    apiKey: '',
-    providerKey: model?.providerKey || '',
-    apiMode: model?.apiMode || 'chat_completions',
-    contextLimit: model?.contextLimit || null,
-    pricing: model?.pricing || emptyPricing,
-    capabilityMode: model?.capabilityMode || 'auto',
-    capabilityOverrides: model?.capabilityOverrides || {},
-  });
+  const [draft, setDraft] = useState<ModelPayload>(() => draftForModel(model));
+  const [savedDraft, setSavedDraft] = useState<ModelPayload>(() => draftForModel(model));
   const [availableModels, setAvailableModels] = useState<string[]>(model?.models?.length ? model.models : [model?.model || ''].filter(Boolean));
   const [detectedCapabilities, setDetectedCapabilities] = useState<Record<string, ModelCapability>>({});
   const [catalogInfo, setCatalogInfo] = useState<CatalogInfo | null>(null);
@@ -8233,8 +8244,21 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
   const filteredPresets = presets.filter((preset) => `${preset.label} ${preset.value}`.toLowerCase().includes(providerQuery.toLowerCase().trim()));
   const canFetchModels = Boolean(draft.baseUrl && !selectedAuthType && /^https?:\/\//i.test(draft.baseUrl));
   const fetchModelsVisible = providerType === 'custom' || canFetchModels;
-  const fetchModelsDisabled = isFetching || !draft.baseUrl || !draft.apiKey || !/^https?:\/\//i.test(draft.baseUrl);
-  const hasUsableApiKey = Boolean(draft.apiKey || model?.hasApiKey || selectedAuthType);
+  const savedCredentialReusable = Boolean(model?.hasApiKey && secureOrigin(savedDraft.baseUrl) && secureOrigin(savedDraft.baseUrl) === secureOrigin(draft.baseUrl));
+  const hasUsableApiKey = Boolean(draft.apiKey || savedCredentialReusable || selectedAuthType);
+  const fetchModelsDisabled = isFetching || !draft.baseUrl || !hasUsableApiKey || !/^https?:\/\//i.test(draft.baseUrl);
+  const isDirty = comparableDraft(draft) !== comparableDraft(savedDraft);
+  const connectionDirty = connectionSignature(draft) !== connectionSignature(savedDraft);
+  const routeChanged = draft.apiMode !== savedDraft.apiMode || draft.baseUrl.trim().replace(/\/+$/, '').toLowerCase() !== savedDraft.baseUrl.trim().replace(/\/+$/, '').toLowerCase();
+  const verificationSignature = connectionSignature(draft);
+  const previousVerificationSignature = useRef(verificationSignature);
+
+  useEffect(() => {
+    if (previousVerificationSignature.current === verificationSignature) return;
+    previousVerificationSignature.current = verificationSignature;
+    setVerifyState('idle');
+    setVerifyMessage('');
+  }, [verificationSignature]);
 
   useEffect(() => {
     const nextProviderType = model ? providerTypeForModel(model) : 'preset';
@@ -8242,26 +8266,9 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
     setSelectedPreset(model?.providerKey || '');
     setProviderQuery('');
     setAvailableModels(model?.models?.length ? model.models : [model?.model || ''].filter(Boolean));
-    setDraft({
-      name: model?.name || '',
-      provider: model?.provider || '',
-      kind: model?.kind || 'official',
-      protocol: model?.protocol || 'OpenAI Compatible',
-      model: model?.model || '',
-      models: model?.models?.length ? model.models : [model?.model || ''].filter(Boolean),
-      baseUrl: model?.baseUrl || '',
-      apiKey: '',
-      providerKey: model?.providerKey || '',
-      apiMode: model?.apiMode || 'chat_completions',
-      modelsUrl: model?.modelsUrl || '',
-      modelApiModes: model?.modelApiModes || {},
-      compat: model?.compat || { thinkingFormat: 'openai', requestOverrides: {} },
-      modelCompat: model?.modelCompat || {},
-      contextLimit: model?.contextLimit || null,
-      pricing: model?.pricing || emptyPricing,
-      capabilityMode: model?.capabilityMode || 'auto',
-      capabilityOverrides: model?.capabilityOverrides || {},
-    });
+    const nextDraft = draftForModel(model);
+    setDraft(nextDraft);
+    setSavedDraft(nextDraft);
     setDetectedCapabilities({});
     setCatalogInfo(null);
     setVerifyState('idle');
@@ -8374,13 +8381,13 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
   }
   async function handleFetchModels() {
     setFetchError('');
-    if (!draft.baseUrl || !draft.apiKey || !/^https?:\/\//i.test(draft.baseUrl)) {
+    if (!draft.baseUrl || !hasUsableApiKey || !/^https?:\/\//i.test(draft.baseUrl)) {
       setFetchError('请先填写有效的 Base URL 和 API Key。');
       return;
     }
     setIsFetching(true);
     try {
-      const result = await fetchAvailableModels(draft.baseUrl, draft.apiKey, draft);
+      const result = await fetchAvailableModels(draft.baseUrl, draft.apiKey, { ...draft, modelId: model?.id });
       const nextModels = result.models;
       setDetectedCapabilities(result.capabilities);
       setCatalogInfo(result.catalog || null);
@@ -8392,32 +8399,54 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
       setIsFetching(false);
     }
   }
+  function currentPayload(): ModelPayload {
+    return {
+      ...draft,
+      name: draft.name || draft.provider || draft.model,
+      provider: draft.provider || selectedPresetData?.label || 'Custom',
+      protocol: protocolFromApiMode(draft.apiMode),
+      kind: providerType === 'custom' ? 'relay' : draft.kind,
+      models: availableModels.length ? availableModels : draft.models,
+      pricing: draft.pricing || emptyPricing,
+    };
+  }
   async function verifyConfiguration() {
     if (!model?.id || !draft.model) return;
     setVerifyState('running');
     setVerifyMessage('');
     try {
       const capability = draft.capabilityMode === 'manual' ? activeManualCapability : activeCapability;
+      const payload = currentPayload();
       const res = await fetch(`/api/models/${model.id}/verify`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: canDiscoverCapabilities ? 'discover' : 'connection', modelId: draft.model, apiKey: draft.apiKey, reasoningEffort: capability?.defaultReasoning || capability?.reasoningEfforts?.[0], serviceTier: capability?.serviceTiers?.[0]?.id }),
+        body: JSON.stringify({ mode: canDiscoverCapabilities ? 'discover' : 'connection', modelId: draft.model, apiKey: draft.apiKey, configuration: payload, saveOnSuccess: true, reasoningEffort: capability?.defaultReasoning || capability?.reasoningEfforts?.[0], serviceTier: capability?.serviceTiers?.[0]?.id }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '配置验证失败。');
       if (data.capability) {
         const nextCapability = data.capability as ModelCapability;
         setDetectedCapabilities((current) => ({ ...current, [draft.model]: nextCapability }));
-        onCapabilityChanged(model.id, draft.model, nextCapability);
       }
+      if (data.catalog) setCatalogInfo(data.catalog as CatalogInfo);
+      const nextDraft = { ...payload, apiKey: '' };
+      previousVerificationSignature.current = connectionSignature(nextDraft);
+      setDraft(nextDraft);
+      setSavedDraft(nextDraft);
+      if (Array.isArray(data.models)) await onSave(nextDraft, { close: false, persistedModels: data.models as ModelProfile[] });
+      if (data.capability) onCapabilityChanged(model.id, draft.model, data.capability as ModelCapability);
       setVerifyState('passed');
       const probeResults = (data.probeResults || []) as CapabilityProbeResult[];
-      if (data.mode === 'discover') {
+      if (data.verificationKind === 'codex_oauth') {
+        setVerifyMessage('授权与账号模型目录验证通过，配置已保存');
+      } else if (data.verificationKind === 'claude_oauth' || data.verificationKind === 'gemini_code_assist') {
+        setVerifyMessage('OAuth 原生验证通过，配置已保存');
+      } else if (data.mode === 'discover') {
         const reasoningCount = probeResults.filter((item) => item.kind === 'reasoning' && item.status === 'accepted').length;
         const priorityAccepted = probeResults.some((item) => item.kind === 'service_tier' && item.status === 'accepted');
         const unknownCount = probeResults.filter((item) => item.status === 'unknown').length;
-        setVerifyMessage(`线路验证完成 · ${reasoningCount} 个推理档位${priorityAccepted ? ' · 支持快速服务层' : ' · 未确认快速服务层'}${unknownCount ? ` · ${unknownCount} 项暂时未知` : ''}`);
+        setVerifyMessage(`验证通过，配置已保存 · ${reasoningCount} 个推理档位${priorityAccepted ? ' · 支持快速服务层' : ' · 未确认快速服务层'}${unknownCount ? ` · ${unknownCount} 项暂时未知` : ''}`);
       } else {
-        setVerifyMessage(`验证通过 · 推理 ${data.effectiveReasoning} · 服务层 ${data.effectiveServiceTier}`);
+        setVerifyMessage(`验证通过，配置已保存 · 推理 ${data.effectiveReasoning} · 服务层 ${data.effectiveServiceTier}`);
       }
     } catch (error) {
       setVerifyState('failed');
@@ -8430,15 +8459,12 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
       setAuthType(selectedAuthType);
       return;
     }
-    await onSave({
-      ...draft,
-      name: draft.name || draft.provider || draft.model,
-      provider: draft.provider || selectedPresetData?.label || 'Custom',
-      protocol: protocolFromApiMode(draft.apiMode),
-      kind: providerType === 'custom' ? 'relay' : draft.kind,
-      models: availableModels.length ? availableModels : draft.models,
-      pricing: emptyPricing,
-    });
+    if (model && connectionDirty && !window.confirm('当前连接参数尚未验证，仍要保存？')) return;
+    await onSave(currentPayload());
+  }
+  function requestClose() {
+    if (isDirty && !window.confirm('当前有未保存的更改，确定要放弃吗？')) return;
+    onClose();
   }
   async function handleAuthSuccess(result: { models?: string[]; catalog?: CatalogInfo; capabilities?: Record<string, ModelCapability>; authenticated?: boolean }) {
     const providerKey = draft.providerKey || selectedPreset;
@@ -8473,7 +8499,7 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
   const saveDisabled = providerType === 'preset'
     ? !selectedPreset || (needsAuthorization ? false : (!draft.model || !(availableModels.length || draft.models.length) || (!selectedAuthType && !draft.baseUrl)))
     : !draft.baseUrl || !hasUsableApiKey || !draft.model || !(availableModels.length || draft.models.length);
-  const activeCapability = detectedCapabilities[draft.model];
+  const activeCapability = routeChanged ? undefined : detectedCapabilities[draft.model];
   const activeManualCapability: ModelCapabilityOverride = draft.capabilityOverrides[draft.model] || { reasoning: false, reasoningEfforts: [], reasoningMap: {}, serviceTiers: [], fastMode: 'none', status: 'unsupported' };
   const canDiscoverCapabilities = providerType === 'custom'
     && draft.capabilityMode === 'auto'
@@ -8482,6 +8508,11 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
   const reasoningOptions = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
   const reasoningOptionLabels: Record<string, string> = { off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最大', ultra: '极致' };
   const capabilitySourceLabel = activeCapability?.source === 'active_probe' ? '线路验证' : activeCapability?.source || '';
+  const verificationButtonLabel = draft.providerKey === 'openai-codex'
+    ? '验证授权并保存'
+    : selectedAuthType
+      ? '验证并保存（可能产生少量用量）'
+      : '验证并保存（消耗少量额度）';
   const capabilitySummary = activeCapability
     ? `${activeCapability.reasoning ? `推理：${activeCapability.reasoningEfforts.join(' / ')}` : activeCapability.reasoningStatus === 'unsupported' ? '不支持推理档位' : '推理能力未确认'} · ${activeCapability.serviceTiers.length ? `服务层：${activeCapability.serviceTiers.map((tier) => tier.name).join(' / ')}` : activeCapability.serviceTierStatus === 'unsupported' ? '不支持速度服务层' : '速度能力未确认'} · ${capabilitySourceLabel}`
     : '获取模型后显示自动识别结果。';
@@ -8509,7 +8540,7 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
   return createPortal((
     <div className="modal-backdrop">
       <div className="modal agent-editor provider-editor" role="dialog" aria-modal="true" aria-labelledby={titleId}>
-        <div className="modal-head"><div><h2 id={titleId}>{model ? '编辑 Provider' : '添加 Provider'}</h2></div><button className="icon-btn" onClick={onClose} aria-label="关闭"><X size={18} /></button></div>
+        <div className="modal-head"><div><h2 id={titleId}>{model ? '编辑 Provider' : '添加 Provider'}</h2>{isDirty && <small className="provider-unsaved">有未保存更改</small>}</div><button type="button" className="icon-btn provider-modal-close" onClick={requestClose} aria-label="关闭"><X size={18} /></button></div>
         <div className="agent-editor-body provider-editor-body">
           {!model && (
             <label className="provider-field"><span>Provider 类型</span><div className="provider-mode-tabs"><button type="button" className={providerType === 'preset' ? 'selected' : ''} onClick={() => resetForProviderType('preset')}>预设</button><button type="button" className={providerType === 'custom' ? 'selected' : ''} onClick={() => resetForProviderType('custom')}>自定义</button></div></label>
@@ -8518,7 +8549,7 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
             <>
               <label className="provider-field provider-combobox-wrap"><span>选择 Provider <em>*</em></span><ProviderPresetCombobox query={providerQuery} open={providerOpen} presets={filteredPresets} onOpenChange={setProviderOpen} onQueryChange={(value) => { setProviderQuery(value); setProviderOpen(true); }} onSelect={applyPreset} /></label>
               <label className="provider-field"><span>Base URL <em>*</em></span><input value={draft.baseUrl} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} placeholder="例如 https://api.example.com/v1" /></label>
-              {!selectedAuthType && <label className="provider-field"><span>API Key <em>*</em></span><input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} placeholder="sk-..." type="password" /></label>}
+              {!selectedAuthType && <label className="provider-field"><span>API Key <em>*</em></span><input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} placeholder={model?.hasApiKey ? '已保存，留空表示继续使用' : 'sk-...'} type="password" />{model?.hasApiKey && !savedCredentialReusable && !draft.apiKey && <small className="error">Base URL 地址已变化，请重新输入 API Key。</small>}</label>}
               {selectedAuthType && <div className="auth-provider-note"><ShieldCheck size={16} /><span>{oauthState === 'ready' ? `${selectedPresetData?.label} 已授权，模型目录已就绪。` : oauthState === 'catalog_error' ? `${selectedPresetData?.label} 已授权，但模型目录尚不可用。` : oauthState === 'authorized_loading_catalog' ? '正在读取授权账号的模型目录。' : `${selectedPresetData?.label} 将通过授权登录保存到 Hermes Profile。`}</span></div>}
               <label className="provider-field"><span>默认模型 <em>*</em></span>{availableModels.length ? <select value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })}>{availableModels.map((item) => <option key={item} value={item}>{item}</option>)}</select> : selectedAuthType ? <input value="" disabled placeholder="授权后获取模型" /> : <input value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} />}</label>
             </>
@@ -8526,7 +8557,7 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
             <>
               <label className="provider-field"><span>名称</span><input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="根据 Base URL 自动生成" /></label>
               <label className="provider-field"><span>Base URL <em>*</em></span><input value={draft.baseUrl} onChange={(event) => updateCustomBaseUrl(event.target.value)} placeholder="例如 https://api.example.com/v1" /></label>
-              <label className="provider-field"><span>API Key <em>*</em></span><input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} placeholder="sk-..." type="password" /></label>
+              <label className="provider-field"><span>API Key <em>*</em></span><input value={draft.apiKey} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} placeholder={model?.hasApiKey ? '已保存，留空表示继续使用' : 'sk-...'} type="password" />{model?.hasApiKey && !savedCredentialReusable && !draft.apiKey && <small className="error">Base URL 地址已变化，请重新输入 API Key。</small>}</label>
               <label className="provider-field"><span>默认模型 <em>*</em></span>{availableModels.length ? <select value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })}>{availableModels.map((item) => <option key={item} value={item}>{item}</option>)}</select> : <input value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} />}</label>
               <label className="provider-field"><span>上下文长度</span><input value={draft.contextLimit ?? ''} onChange={(event) => { const parsed = Number(event.target.value); setDraft({ ...draft, contextLimit: event.target.value && Number.isFinite(parsed) ? Math.max(0, parsed) : null }); }} placeholder="例如 256000（可选）" inputMode="numeric" /></label>
               <label className="provider-field"><span>API 协议</span><select value={draft.apiMode || 'chat_completions'} onChange={(event) => setDraft({ ...draft, apiMode: event.target.value as ProviderApiMode })}><option value="chat_completions">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option><option value="codex_responses">OpenAI Codex Responses</option><option value="anthropic_messages">Anthropic Messages</option><option value="bedrock_converse">Bedrock Converse</option><option value="codex_app_server">Codex App Server</option></select></label>
@@ -8536,7 +8567,7 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
           {fetchModelsVisible && <button type="button" className="secondary-btn provider-fetch" onClick={() => void handleFetchModels()} disabled={fetchModelsDisabled}>{isFetching ? '获取中' : '获取模型'}</button>}
           {selectedAuthType && draft.providerKey === 'openai-codex' && authorizedProviders[draft.providerKey] && !availableModels.length && <button type="button" className="secondary-btn provider-fetch" onClick={() => void refreshOAuthCatalog()} disabled={isFetching}>{isFetching ? '正在获取模型' : '重新获取模型'}</button>}
           {fetchError && <div className="form-error">{fetchError}</div>}
-          {catalogInfo && <div className="provider-catalog-status"><strong>模型目录：{catalogInfo.source === 'provider_catalog' ? 'Provider 富目录' : catalogInfo.source === 'model_ids' ? '仅模型 ID' : '本地目录'}</strong><small>{catalogInfo.lastSuccessAt ? `最近成功 ${new Date(catalogInfo.lastSuccessAt).toLocaleString()}` : '尚未成功刷新'}{catalogInfo.refreshError ? ` · ${catalogInfo.refreshError}` : ''}</small></div>}
+          {routeChanged && draft.baseUrl.trim().replace(/\/+$/, '').toLowerCase() !== savedDraft.baseUrl.trim().replace(/\/+$/, '').toLowerCase() ? <div className="provider-catalog-status"><strong>模型目录：待重新获取</strong><small>Base URL 已变化，现有目录仅供参考。</small></div> : catalogInfo && <div className="provider-catalog-status"><strong>模型目录：{catalogInfo.source === 'provider_catalog' ? 'Provider 富目录' : catalogInfo.source === 'model_ids' ? '仅模型 ID' : '本地目录'}</strong><small>{catalogInfo.lastSuccessAt ? `最近成功 ${new Date(catalogInfo.lastSuccessAt).toLocaleString()}` : '尚未成功刷新'}{catalogInfo.refreshError ? ` · ${catalogInfo.refreshError}` : ''}</small></div>}
           <section className="provider-capability-settings">
             <div className="provider-capability-head"><div><strong>能力设置</strong><small>{draft.model || '请先选择默认模型'}</small></div><div className="provider-mode-tabs capability-mode-tabs"><button type="button" className={draft.capabilityMode === 'auto' ? 'selected' : ''} onClick={() => setDraft({ ...draft, capabilityMode: 'auto' })}>自动识别</button><button type="button" className={draft.capabilityMode === 'manual' ? 'selected' : ''} onClick={() => setDraft({ ...draft, capabilityMode: 'manual' })}>手动</button></div></div>
             {draft.capabilityMode === 'auto' ? <p className="provider-capability-summary">{capabilitySummary}</p> : (
@@ -8549,9 +8580,9 @@ function ModelEditorModal({ model, onClose, onSave, fetchAvailableModels, onCapa
               </div>
             )}
           </section>
-          {model?.id && <div className="provider-verification"><button type="button" className="secondary-btn" disabled={verifyState === 'running'} onClick={() => void verifyConfiguration()}>{verifyState === 'running' ? (canDiscoverCapabilities ? '正在识别能力' : '验证中') : canDiscoverCapabilities ? '验证并识别能力（消耗少量额度）' : '验证配置（消耗少量额度）'}</button>{verifyMessage && <small className={verifyState === 'failed' ? 'error' : ''}>{verifyMessage}</small>}</div>}
+          {model?.id && <div className="provider-verification"><button type="button" className="secondary-btn" disabled={verifyState === 'running' || !hasUsableApiKey} onClick={() => void verifyConfiguration()}>{verifyState === 'running' ? (canDiscoverCapabilities ? '正在识别并保存' : '正在验证并保存') : verificationButtonLabel}</button>{verifyMessage && <small className={verifyState === 'failed' ? 'error' : ''}>{verifyMessage}</small>}</div>}
         </div>
-        <div className="provider-modal-footer"><button className="secondary-btn" onClick={onClose}>取消</button><button className="send-btn" onClick={() => void saveDraft()} disabled={saveDisabled}>{needsAuthorization ? '授权' : model ? '保存' : '添加'}</button></div>
+        <div className="provider-modal-footer"><button className="secondary-btn" onClick={requestClose}>取消</button><button className="send-btn" onClick={() => void saveDraft()} disabled={saveDisabled}>{needsAuthorization ? '授权' : model ? '保存' : '添加'}</button></div>
         {authType && <ProviderAuthModal authType={authType} onClose={() => { setAuthType(null); setOauthState('unauthenticated'); }} onSuccess={(result) => void handleAuthSuccess(result)} />}
       </div>
     </div>
@@ -8690,7 +8721,7 @@ function ProviderAuthModal({ authType, onClose, onSuccess }: { authType: Provide
   return (
     <div className="modal-backdrop nested">
       <div className="modal auth-modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
-        <div className="modal-head"><div><h2 id={titleId}>{title}</h2><p>{status === 'waiting' ? '浏览器会打开授权页面，完成后回到这里。' : '正在准备授权。'}</p></div><button className="icon-btn" onClick={onClose} aria-label="关闭"><X size={18} /></button></div>
+        <div className="modal-head"><div><h2 id={titleId}>{title}</h2><p>{status === 'waiting' ? '浏览器会打开授权页面，完成后回到这里。' : '正在准备授权。'}</p></div><button type="button" className="icon-btn provider-modal-close" onClick={onClose} aria-label="关闭"><X size={18} /></button></div>
         <div className="auth-modal-body">
           {status === 'loading' && <div className="auth-state"><RefreshCw className="spin" size={22} /><span>正在启动授权...</span></div>}
           {status === 'waiting' && authType === 'codex-device' && <div className="auth-state"><strong className="auth-code">{userCode}</strong><button className="secondary-btn" onClick={() => navigator.clipboard?.writeText(userCode)}>复制授权码</button><button className="send-btn" onClick={() => void openExternalUrl(authUrl)}><ExternalLink size={15} />重新打开授权页面</button></div>}

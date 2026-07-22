@@ -7,6 +7,28 @@ export const CATALOG_REFRESH_MS = 4 * 60 * 60 * 1000;
 
 function clean(value) { return String(value || '').trim(); }
 
+function hasOwn(value, key) {
+  return Boolean(value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function firstOwn(value, keys) {
+  for (const key of keys) if (hasOwn(value, key)) return value[key];
+  return undefined;
+}
+
+function catalogReasoningMap(raw) {
+  const direct = firstOwn(raw, ['reasoningMap', 'reasoning_map']);
+  if (direct !== undefined) return direct;
+  const levels = firstOwn(raw, ['supported_reasoning_levels', 'supported_reasoning_efforts', 'reasoning_levels']);
+  const result = {};
+  for (const item of Array.isArray(levels) ? levels : []) {
+    const effort = clean(typeof item === 'string' ? item : item?.effort);
+    if (!effort || hasOwn(result, effort)) continue;
+    result[effort] = effort === 'off' ? 'none' : effort;
+  }
+  return result;
+}
+
 function providerCacheKey(model = {}) {
   return [clean(model.providerKey) || 'custom', clean(model.apiMode) || 'unknown', clean(model.baseUrl).replace(/\/+$/, '').toLowerCase()].join('::');
 }
@@ -19,7 +41,10 @@ export function readCatalogCache(filePath) {
     if (parsed.catalogVersion !== CATALOG_VERSION) {
       cache.verifications = {};
       for (const entry of Object.values(cache.providers)) {
-        entry.records = Object.fromEntries(Object.entries(entry.records || {}).filter(([, record]) => record?.source !== 'active_probe'));
+        entry.records = {};
+        entry.lastSuccessAt = null;
+        entry.source = entry.modelIds?.length ? 'model_ids' : 'none';
+        entry.catalogVersion = CATALOG_VERSION;
       }
     }
     return cache;
@@ -73,10 +98,15 @@ export function parseCatalogResponse(body, model) {
     const modelId = clean(raw?.id || raw?.slug || raw?.name || raw);
     if (!modelId) continue;
     if (!raw || typeof raw !== 'object') continue;
-    const hasRichFields = raw.reasoningMap || raw.reasoning_map || raw.supported_reasoning_levels || raw.reasoning_levels || raw.service_tiers || raw.serviceTiers || raw.context_length || raw.context_window || raw.input;
+    const reasoningDeclared = ['reasoningMap', 'reasoning_map', 'supported_reasoning_levels', 'supported_reasoning_efforts', 'reasoning_levels'].some((key) => hasOwn(raw, key));
+    const serviceTiersDeclared = ['service_tiers', 'serviceTiers'].some((key) => hasOwn(raw, key));
+    const hasRichFields = reasoningDeclared || serviceTiersDeclared || hasOwn(raw, 'default_reasoning_level') || hasOwn(raw, 'default_reasoning') || raw.context_length || raw.context_window || raw.input;
     if (!hasRichFields) continue;
     rich = true;
-    const reasoningMap = raw.reasoningMap || raw.reasoning_map || Object.fromEntries((raw.supported_reasoning_levels || raw.reasoning_levels || []).map((level) => [level, level]));
+    const reasoningMap = catalogReasoningMap(raw);
+    const serviceTiers = firstOwn(raw, ['service_tiers', 'serviceTiers']) || [];
+    const hasReasoning = Object.values(reasoningMap && typeof reasoningMap === 'object' ? reasoningMap : {}).some((value) => typeof value === 'string' && clean(value));
+    const hasServiceTiers = Array.isArray(serviceTiers) && serviceTiers.length > 0;
     records[catalogKey(model, modelId)] = normalizeCapabilityRecord({
       modelId,
       name: raw.display_name || raw.name || modelId,
@@ -84,10 +114,12 @@ export function parseCatalogResponse(body, model) {
       contextLength: raw.context_length || raw.context_window,
       defaultReasoning: raw.default_reasoning_level || raw.default_reasoning,
       reasoningMap,
-      serviceTiers: raw.service_tiers || raw.serviceTiers || [],
+      serviceTiers,
       source: 'provider_catalog',
       confidence: 'confirmed',
       status: 'confirmed',
+      reasoningStatus: reasoningDeclared ? (hasReasoning ? 'confirmed' : 'unsupported') : 'unknown',
+      serviceTierStatus: serviceTiersDeclared ? (hasServiceTiers ? 'confirmed' : 'unsupported') : 'unknown',
       updatedAt: new Date().toISOString(),
     }, modelId);
   }

@@ -30,11 +30,21 @@ export function normalizeCodexCatalog(body) {
 export async function fetchCodexOAuthCatalog({ accessToken, fetchImpl = fetch, endpoint = 'https://chatgpt.com/backend-api/codex/models?client_version=1.0.0', timeoutMs = 10000 }) {
   const token = clean(accessToken);
   if (!token) throw new Error('Codex 授权凭据不可用。');
-  const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' };
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/json',
+    'User-Agent': 'codex_cli_rs/0.0.0 (Frakio Work)',
+    originator: 'codex_cli_rs',
+  };
   const accountId = extractChatGptAccountId(token);
   if (accountId) headers['ChatGPT-Account-Id'] = accountId;
   const response = await fetchImpl(endpoint, { headers, signal: AbortSignal.timeout(timeoutMs) });
-  if (!response.ok) throw new Error(`Codex 模型目录获取失败：HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(`Codex 模型目录获取失败：HTTP ${response.status}`);
+    error.status = response.status;
+    error.code = response.status === 401 ? 'oauth_expired' : response.status === 403 ? 'provider_rejected' : 'catalog_refresh_failed';
+    throw error;
+  }
   const catalog = normalizeCodexCatalog(await response.json());
   if (!catalog.models.length) throw new Error('Codex 模型目录没有返回当前账号可用的模型。');
   return { ...catalog, accountId };
