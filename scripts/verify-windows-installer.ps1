@@ -13,6 +13,7 @@ if (-not (Test-Path $uninstaller)) { throw "Uninstaller is missing: $uninstaller
 
 $app = Start-Process -FilePath $appPath -PassThru
 try {
+  Write-Host 'Waiting for installed Frakio Work API.'
   $ready = $false
   $apiPort = 0
   for ($attempt = 0; $attempt -lt 120; $attempt += 1) {
@@ -28,13 +29,16 @@ try {
   }
   if (-not $ready) { throw 'Installed application did not expose a healthy local API.' }
 
+  Write-Host "Local API ready on port $apiPort; waiting for win-x64 Runtime and Bridge."
   $runtimeReady = $false
+  $lastRuntime = $null
   for ($attempt = 0; $attempt -lt 120; $attempt += 1) {
     Start-Sleep -Seconds 1
     try {
       $runtime = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/hermes-runtime/status" -TimeoutSec 2
+      $lastRuntime = $runtime
       $bridge = $runtime.autoStart.steps | Where-Object { $_.id -eq 'bridge' } | Select-Object -First 1
-      if ($runtime.autoStart.status -eq 'ready' -and $bridge.status -eq 'ready') {
+      if ($runtime.runtime.platform -eq 'win-x64' -and $runtime.bridge.ready -and $bridge.status -eq 'ready') {
         $runtimeReady = $true
         break
       }
@@ -44,7 +48,10 @@ try {
     }
     if ($app.HasExited) { throw "Installed application exited before Runtime became ready with code $($app.ExitCode)." }
   }
-  if (-not $runtimeReady) { throw 'Installed Hermes Runtime and Bridge did not become ready.' }
+  if (-not $runtimeReady) {
+    $summary = if ($lastRuntime) { $lastRuntime | ConvertTo-Json -Depth 8 -Compress } else { 'no runtime response' }
+    throw "Installed win-x64 Runtime and Bridge did not become ready. Last status: $summary"
+  }
   if (-not (Test-Path (Join-Path $env:USERPROFILE '.frakio-work\logs\desktop.log'))) {
     throw 'Installed application did not create its Windows user-data log.'
   }
