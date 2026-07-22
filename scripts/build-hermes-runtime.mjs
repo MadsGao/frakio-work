@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { portablePythonRoot, runtimeBuildTarget } from './runtime-build-platform.mjs';
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -17,14 +18,7 @@ const nodeVersion = process.env.FRAKIO_NODE_VERSION || '24.16.0';
 const pinnedHermesTag = process.env.HERMES_AGENT_TAG || 'v2026.7.7.2';
 const aiohttpVersion = '3.14.1';
 
-function platformName() {
-  if (process.platform !== 'darwin') throw new Error('Bundled desktop runtimes are built on macOS runners.');
-  return process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
-}
-
-function nodePlatformName() {
-  return process.arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64';
-}
+const buildTarget = runtimeBuildTarget(process.platform, process.arch, nodeVersion);
 
 async function command(commandName, args, options = {}) {
   const { stdout = '', stderr = '' } = await execFileAsync(commandName, args, {
@@ -117,22 +111,23 @@ async function verifyRuntimeApi(python, pythonRoot) {
 async function installPortablePython(staging) {
   await command('uv', ['python', 'install', pythonVersion], { timeout: 15 * 60 * 1000 });
   const executable = await command('uv', ['python', 'find', pythonVersion, '--managed-python']);
-  const sourceRoot = path.dirname(path.dirname(executable));
+  const sourceRoot = portablePythonRoot(executable, process.platform);
   const destination = path.join(staging, 'python');
   await cp(sourceRoot, destination, { recursive: true, dereference: true, preserveTimestamps: true });
-  await unlink(path.join(destination, 'lib', `python${pythonVersion.split('.').slice(0, 2).join('.')}`, 'EXTERNALLY-MANAGED')).catch(() => null);
-  const bin = path.join(destination, 'bin');
-  const versionedName = `python${pythonVersion.split('.').slice(0, 2).join('.')}`;
-  for (const name of ['python', 'python3']) {
-    await unlink(path.join(bin, name)).catch(() => null);
-    await symlink(versionedName, path.join(bin, name));
+  if (process.platform !== 'win32') {
+    await unlink(path.join(destination, 'lib', `python${pythonVersion.split('.').slice(0, 2).join('.')}`, 'EXTERNALLY-MANAGED')).catch(() => null);
+    const bin = path.join(destination, 'bin');
+    const versionedName = `python${pythonVersion.split('.').slice(0, 2).join('.')}`;
+    for (const name of ['python', 'python3']) {
+      await unlink(path.join(bin, name)).catch(() => null);
+      await symlink(versionedName, path.join(bin, name));
+    }
   }
-  return path.join(bin, 'python3');
+  return path.join(destination, ...buildTarget.pythonExecutableParts);
 }
 
 async function installPortableNode(staging, downloadsRoot) {
-  const platform = nodePlatformName();
-  const archiveName = `node-v${nodeVersion}-${platform}.tar.gz`;
+  const archiveName = buildTarget.nodeArchiveName;
   const baseUrl = `https://nodejs.org/dist/v${nodeVersion}`;
   const archivePath = path.join(downloadsRoot, archiveName);
   const checksumsPath = path.join(downloadsRoot, 'SHASUMS256.txt');
@@ -141,8 +136,8 @@ async function installPortableNode(staging, downloadsRoot) {
   if (!expected) throw new Error(`Node checksum is missing for ${archiveName}.`);
   const actual = await sha256(archivePath);
   if (actual !== expected) throw new Error(`Node checksum mismatch for ${archiveName}.`);
-  const extracted = path.join(downloadsRoot, `node-v${nodeVersion}-${platform}`);
-  await command('tar', ['-xzf', archivePath, '-C', downloadsRoot]);
+  const extracted = path.join(downloadsRoot, archiveName.replace(/\.(?:tar\.gz|zip)$/, ''));
+  await command('tar', [archiveName.endsWith('.zip') ? '-xf' : '-xzf', archivePath, '-C', downloadsRoot]);
   await cp(extracted, path.join(staging, 'node'), { recursive: true, dereference: true, preserveTimestamps: true });
 }
 
@@ -159,6 +154,7 @@ async function checkoutHermes(sourceDir) {
 }
 
 async function rewritePythonEntrypoints(runtimeDir) {
+  if (process.platform === 'win32') return;
   const bin = path.join(runtimeDir, 'python', 'bin');
   const { readdir } = await import('node:fs/promises');
   const entries = await readdir(bin, { withFileTypes: true });
@@ -175,7 +171,7 @@ async function rewritePythonEntrypoints(runtimeDir) {
   }
 }
 
-const platform = platformName();
+const platform = buildTarget.runtimePlatform;
 const buildRoot = path.join(projectRoot, '.runtime-build');
 const sourceDir = path.join(buildRoot, 'hermes-agent');
 const downloadsRoot = path.join(buildRoot, 'downloads', platform);

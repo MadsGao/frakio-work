@@ -7,6 +7,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { isAllowedExternalUrl } = require('./external-url.cjs');
+const { electronNodeExecutable: resolveElectronNodeExecutable } = require('./platform-paths.cjs');
 
 const APP_NAME = 'Frakio Work';
 const DEFAULT_PORT = 8787;
@@ -105,10 +106,13 @@ async function waitForHealth(url) {
 }
 
 function electronNodeExecutable() {
-  if (app.isPackaged) {
-    return path.join(process.resourcesPath, '..', 'MacOS', APP_NAME);
-  }
-  return path.resolve(process.execPath);
+  return resolveElectronNodeExecutable({
+    packaged: app.isPackaged,
+    platform: process.platform,
+    resourcesPath: process.resourcesPath,
+    execPath: process.execPath,
+    appName: APP_NAME,
+  });
 }
 
 function serverEntry() {

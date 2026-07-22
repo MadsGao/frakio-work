@@ -25,6 +25,7 @@ jobs:
       - run: npm run check:syntax
       - run: npm run typecheck
       - run: npm test
+      - run: npm run test:bridge
       - run: npm run test:smoke
       - run: npm run build
       - run: npm audit --audit-level=high

@@ -20,12 +20,20 @@ export function compareVersions(left, right) {
 }
 
 export function selectReleaseAsset(assets = [], { platform = process.platform, arch = process.arch } = {}) {
-  if (platform !== 'darwin') return null;
   const architecture = arch === 'arm64' ? 'arm64' : 'x64';
-  const candidates = assets.filter((asset) => String(asset?.name || '').toLowerCase().endsWith('.dmg'));
-  return candidates.find((asset) => String(asset.name).toLowerCase().includes(`-${architecture}.dmg`))
-    || candidates.find((asset) => String(asset.name).toLowerCase().includes(architecture))
-    || null;
+  if (platform === 'darwin') {
+    const candidates = assets.filter((asset) => String(asset?.name || '').toLowerCase().endsWith('.dmg'));
+    return candidates.find((asset) => String(asset.name).toLowerCase().includes(`-${architecture}.dmg`))
+      || candidates.find((asset) => String(asset.name).toLowerCase().includes(architecture))
+      || null;
+  }
+  if (platform === 'win32' && architecture === 'x64') {
+    const candidates = assets.filter((asset) => String(asset?.name || '').toLowerCase().endsWith('.exe'));
+    return candidates.find((asset) => String(asset.name).toLowerCase().includes('-x64.exe'))
+      || candidates.find((asset) => String(asset.name).toLowerCase().includes('x64'))
+      || null;
+  }
+  return null;
 }
 
 function decodeFeedText(value = '') {
@@ -46,16 +54,20 @@ async function fetchLatestReleaseFromFeed(fetchImpl) {
   const tag = htmlUrl.match(/\/tag\/([^/?#]+)/)?.[1] || '';
   if (!tag) throw new Error('GitHub does not have a published Frakio Work release yet.');
   const version = tag.replace(/^v/i, '');
-  const assetName = (arch) => `Frakio.Work-${version}-${arch}.dmg`;
+  const asset = (name) => ({
+    name,
+    browser_download_url: `${repositoryUrl}/releases/download/${tag}/${name}`,
+  });
   return {
     tag_name: tag,
     html_url: htmlUrl,
     body: decodeFeedText(entry.match(/<content[^>]*>([\s\S]*?)<\/content>/)?.[1] || ''),
     published_at: entry.match(/<updated>([^<]+)<\/updated>/)?.[1] || '',
-    assets: ['arm64', 'x64'].map((arch) => ({
-      name: assetName(arch),
-      browser_download_url: `${repositoryUrl}/releases/download/${tag}/${assetName(arch)}`,
-    })),
+    assets: [
+      asset(`Frakio.Work-${version}-arm64.dmg`),
+      asset(`Frakio.Work-${version}-x64.dmg`),
+      asset(`Frakio.Work-${version}-x64.exe`),
+    ],
   };
 }
 

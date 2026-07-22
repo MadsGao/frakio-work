@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 Beta — 2026-07-22
+
+微信登录二维码现在直接显示在 Frakio Work 内，不再跳转到外部页面。登录弹窗会持续显示等待、已扫码和确认状态；二维码过期或读取失败时可以重新获取。关闭弹窗或切换 Profile 会立即停止旧轮询，避免已取消的登录请求继续写入当前配置。
+
+本版本首次提供 Windows 10/11 x64 桌面安装包。Windows 版内置原生 Python、Node.js、Hermes Agent 和 Frakio Bridge，并与 Apple Silicon、Intel Mac 安装包一起由 GitHub Actions 构建。应用内更新页会按当前平台选择 DMG 或 Windows EXE。Windows 安装包尚未进行代码签名，首次打开时可能显示 Microsoft Defender SmartScreen 提示。
+
+构建期依赖已更新至修复版本，解决 `brace-expansion`、`fast-uri` 和 `shell-quote` 的高危安全告警。CI 继续在 Ubuntu、Windows 和 macOS 上执行完整安全审计，不降低审计等级。
+
 ## 0.1.4 Beta — 2026-07-22
 
 ### 0.1.4 后续修订

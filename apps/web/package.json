@@ -1,6 +1,6 @@
 {
   "name": "@frakio/web",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,8 +12,9 @@
     "@fontsource/doto": "^5.2.8",
     "@fontsource/space-grotesk": "^5.2.8",
     "@fontsource/space-mono": "^5.2.8",
-    "@frakio/contracts": "0.1.4",
+    "@frakio/contracts": "0.1.5",
     "lucide-react": "^0.468.0",
+    "qrcode.react": "^4.2.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-markdown": "^10.1.0",

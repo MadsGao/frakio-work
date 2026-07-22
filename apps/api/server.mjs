@@ -21,7 +21,7 @@ import { probeResponsesCapabilities } from './lib/capability-probe.mjs';
 import { createLocalSecurity } from './lib/local-security.mjs';
 import { isSystemHermesProfile, resolveDeletableHermesProfileDir, userVisibleHermesProfiles } from './lib/hermes-profile-safety.mjs';
 import { resolveInsideRoot } from './lib/path-boundary.mjs';
-import { resolveCommand as resolvePlatformCommand, runtimePlatformDir } from './lib/platform.mjs';
+import { resolveCommand as resolvePlatformCommand, runtimeNodeCandidate, runtimePlatformDir, runtimePythonCandidates } from './lib/platform.mjs';
 import { capabilitiesForModels, mapRunSettings, normalizeCapabilityOverrides, resolveModelCapability } from './lib/model-capabilities.mjs';
 import { createModelRunDiagnostic, finishModelRunDiagnostic, markModelRunSent } from './lib/model-run-diagnostics.mjs';
 import { CHAT_THINKING_FORMATS, candidateModelUrls, directHttpRequestOverrides } from './lib/provider-adapters.mjs';
@@ -431,14 +431,11 @@ function hermesRuntimePlatformDir() {
 }
 
 function hermesPythonCandidates(runtimeDir) {
-  return [
-    path.join(runtimeDir, 'python', process.platform === 'win32' ? 'python.exe' : 'bin/python3'),
-    path.join(runtimeDir, 'python', process.platform === 'win32' ? 'python.exe' : 'bin/python'),
-  ];
+  return runtimePythonCandidates(runtimeDir);
 }
 
 function hermesNodeCandidate(runtimeDir) {
-  return path.join(runtimeDir, 'node', process.platform === 'win32' ? 'node.exe' : 'bin/node');
+  return runtimeNodeCandidate(runtimeDir);
 }
 
 function defaultRuntimeRegistry() {
@@ -6556,7 +6553,9 @@ async function updatesStatus() {
     }),
   ]);
   const frakioWork = {
-    path: release.installMode === 'desktop-release' ? '当前 macOS 安装包' : projectRoot,
+    path: release.installMode === 'desktop-release'
+      ? (process.platform === 'win32' ? '当前 Windows 安装包' : '当前 macOS 安装包')
+      : projectRoot,
     isGitRepo: true,
     installKind: release.installMode,
     currentCommit: '',

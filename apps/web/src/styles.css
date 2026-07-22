@@ -3888,6 +3888,48 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .weixin-qr-section span.error {
   color: #b45309;
 }
+.modal.weixin-qr-modal {
+  width: min(420px, calc(100vw - 32px));
+}
+.weixin-qr-modal-body {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  padding: 24px 24px 28px;
+  text-align: center;
+}
+.weixin-qr-code {
+  display: grid;
+  place-items: center;
+  width: 264px;
+  height: 264px;
+  border: 1px solid #e1e7e4;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 12px 30px rgb(15 23 42 / 8%);
+}
+.weixin-qr-code.placeholder {
+  color: #64736e;
+  background: rgb(248 250 249 / 86%);
+}
+.weixin-qr-code svg {
+  display: block;
+  max-width: calc(100% - 24px);
+  height: auto;
+}
+.weixin-qr-status {
+  min-height: 20px;
+  color: #53635e;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.weixin-qr-status.error {
+  color: #b45309;
+}
+@media (max-width: 420px) {
+  .weixin-qr-modal-body { padding: 20px 16px 24px; }
+  .weixin-qr-code { width: min(264px, calc(100vw - 80px)); height: min(264px, calc(100vw - 80px)); }
+}
 .platform-actions {
   display: flex;
   justify-content: flex-end;

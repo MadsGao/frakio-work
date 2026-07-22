@@ -13,6 +13,15 @@ export function runtimePlatformDir(platform = process.platform, arch = process.a
   return 'linux-x64';
 }
 
+export function runtimePythonCandidates(runtimeDir, platform = process.platform) {
+  if (platform === 'win32') return [path.join(runtimeDir, 'python', 'python.exe')];
+  return [path.join(runtimeDir, 'python', 'bin', 'python3'), path.join(runtimeDir, 'python', 'bin', 'python')];
+}
+
+export function runtimeNodeCandidate(runtimeDir, platform = process.platform) {
+  return path.join(runtimeDir, 'node', platform === 'win32' ? 'node.exe' : 'bin/node');
+}
+
 export async function resolveCommand(command, { cwd = process.cwd(), env = process.env, platform = process.platform } = {}) {
   const clean = String(command || '').trim();
   if (!clean) return '';

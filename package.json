@@ -1,6 +1,6 @@
 {
   "name": "frakio-work",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "license": "MIT",
   "description": "Frakio Work — an open-source multi-agent workspace for Hermes Agent.",
@@ -25,8 +25,8 @@
     "build": "npm run typecheck && npm run build --workspace @frakio/web",
     "typecheck": "tsc -b",
     "check:syntax": "node --check apps/api/server.mjs && node --check apps/desktop/main.cjs && node --check bin/hermes-workbench-mcp.mjs",
-    "test": "node --test apps/api/*.test.mjs apps/api/lib/*.test.mjs apps/desktop/*.test.cjs",
-    "test:bridge": "python3 -m unittest discover -s runtime/agent-bridge/python -p 'test_*.py'",
+    "test": "node --test apps/api/*.test.mjs apps/api/lib/*.test.mjs apps/desktop/*.test.cjs scripts/*.test.mjs",
+    "test:bridge": "node scripts/run-bridge-tests.mjs",
     "test:telemetry": "node --test apps/api/telemetry.test.mjs",
     "test:smoke": "node scripts/smoke-api.mjs",
     "test:e2e:release": "node scripts/e2e-release.mjs",
@@ -39,6 +39,7 @@
     "desktop:dev": "FRAKIO_WORK_DESKTOP=1 electron .",
     "desktop:pack": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --dir --publish never",
     "desktop:dist:mac": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --mac dmg zip --publish never",
+    "desktop:dist:win": "npm run assets:build && npm run prepare-runtime && npm run build && electron-builder --win nsis --x64 --publish never",
     "clean": "node scripts/clean-generated.mjs",
     "desktop:clean": "node scripts/clean-generated.mjs"
   },
@@ -93,6 +94,20 @@
     },
     "dmg": {
       "artifactName": "Frakio.Work-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "artifactName": "Frakio.Work-${version}-${arch}.${ext}",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowElevation": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true
     }
   }
 }

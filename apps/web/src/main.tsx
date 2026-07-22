@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef,
 import type { AppUpdateStatus, Attachment } from '@frakio/contracts';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
+import { QRCodeSVG } from 'qrcode.react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -4582,7 +4583,7 @@ function platformConfigured(platform: PlatformDefinition, credentials: Record<st
 
 function qrStatusLabel(status: WeixinQrStatus['status']) {
   if (status === 'loading') return '正在获取二维码...';
-  if (status === 'waiting') return '二维码已打开，请使用微信扫码登录。';
+  if (status === 'waiting') return '请使用微信扫码登录。';
   if (status === 'scaned') return '已扫码，请在微信中确认登录。';
   if (status === 'expired') return '二维码已过期，请重新登录。';
   if (status === 'confirmed') return '已确认，正在保存凭据。';
@@ -4590,7 +4591,42 @@ function qrStatusLabel(status: WeixinQrStatus['status']) {
   return '';
 }
 
-type WeixinQrStatus = { status: 'idle' | 'loading' | 'waiting' | 'scaned' | 'scaned_but_redirect' | 'expired' | 'confirmed' | 'error'; qrcode?: string; error?: string };
+type WeixinQrStatus = { status: 'idle' | 'loading' | 'waiting' | 'scaned' | 'scaned_but_redirect' | 'expired' | 'confirmed' | 'error'; qrcode?: string; qrcodeUrl?: string; error?: string };
+
+function WeixinQrDialog({ state, onClose, onRetry }: { state: WeixinQrStatus; onClose: () => void; onRetry: () => void }) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  return createPortal(
+    <div className="modal-backdrop weixin-qr-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div className="modal weixin-qr-modal" role="dialog" aria-modal="true" aria-labelledby="weixin-qr-title">
+        <div className="modal-head">
+          <div><h2 id="weixin-qr-title">微信扫码登录</h2><p>使用微信扫描二维码，为当前 Profile 连接 Weixin。</p></div>
+          <button type="button" className="icon-btn" onClick={onClose} aria-label="关闭"><X size={18} /></button>
+        </div>
+        <div className="weixin-qr-modal-body">
+          <div className={`weixin-qr-code ${state.qrcodeUrl ? '' : 'placeholder'}`}>
+            {state.qrcodeUrl
+              ? <QRCodeSVG value={state.qrcodeUrl} size={232} level="M" marginSize={2} title="微信登录二维码" />
+              : <LoaderCircle className="spin" size={30} aria-hidden="true" />}
+          </div>
+          <div className={`weixin-qr-status ${state.status === 'error' || state.status === 'expired' ? 'error' : ''}`} role="status">
+            {state.error || qrStatusLabel(state.status)}
+          </div>
+          {(state.status === 'expired' || state.status === 'error') && (
+            <button type="button" className="send-btn" onClick={onRetry}>重新获取二维码</button>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
 
 function ChannelsPage({ profiles, defaultProfile, embedded = false }: { profiles: HermesProfile[]; defaultProfile: string; embedded?: boolean }) {
   const [profile, setProfile] = useState(defaultProfile || 'default');
@@ -4605,6 +4641,14 @@ function ChannelsPage({ profiles, defaultProfile, embedded = false }: { profiles
   const [saving, setSaving] = useState('');
   const [error, setError] = useState('');
   const weixinPollRef = useRef<number | null>(null);
+  const weixinAttemptRef = useRef(0);
+
+  const closeWeixinQrLogin = useCallback(() => {
+    weixinAttemptRef.current += 1;
+    if (weixinPollRef.current) window.clearTimeout(weixinPollRef.current);
+    weixinPollRef.current = null;
+    setWeixinQr({ status: 'idle' });
+  }, []);
 
   async function loadChannels(nextProfile = profile) {
     setLoading(true);
@@ -4628,7 +4672,12 @@ function ChannelsPage({ profiles, defaultProfile, embedded = false }: { profiles
     void loadChannels(profile);
   }, [profile]);
 
+  useEffect(() => {
+    closeWeixinQrLogin();
+  }, [profile, closeWeixinQrLogin]);
+
   useEffect(() => () => {
+    weixinAttemptRef.current += 1;
     if (weixinPollRef.current) window.clearTimeout(weixinPollRef.current);
   }, []);
 
@@ -4678,45 +4727,55 @@ function ChannelsPage({ profiles, defaultProfile, embedded = false }: { profiles
     }
   }
 
-  async function pollWeixinStatus(qrcode: string) {
+  async function pollWeixinStatus(qrcode: string, attempt: number) {
     try {
-      const data = await requestJson<{ status: WeixinQrStatus['status']; account_id?: string; token?: string; base_url?: string }>(`/api/hermes/weixin/qrcode/status?qrcode=${encodeURIComponent(qrcode)}`);
+      const data = await requestJson<{ status: WeixinQrStatus['status'] | 'wait'; account_id?: string; token?: string; base_url?: string }>(`/api/hermes/weixin/qrcode/status?qrcode=${encodeURIComponent(qrcode)}`);
+      if (attempt !== weixinAttemptRef.current) return;
       if (data.status === 'confirmed' && data.account_id && data.token) {
-        setWeixinQr({ status: 'confirmed', qrcode });
+        setWeixinQr((current) => ({ ...current, status: 'confirmed', qrcode }));
         await requestJson(`/api/hermes/weixin/save?profile=${encodeURIComponent(profile)}`, {
           method: 'POST',
           body: JSON.stringify({ account_id: data.account_id, token: data.token, base_url: data.base_url }),
         });
+        if (attempt !== weixinAttemptRef.current) return;
         await loadChannels(profile);
-        setWeixinQr({ status: 'idle' });
+        if (attempt === weixinAttemptRef.current) closeWeixinQrLogin();
         return;
       }
       if (data.status === 'expired') {
-        setWeixinQr({ status: 'expired', qrcode });
+        setWeixinQr((current) => ({ ...current, status: 'expired', qrcode }));
         return;
       }
-      setWeixinQr({ status: data.status === 'scaned_but_redirect' ? 'scaned' : data.status, qrcode });
-      weixinPollRef.current = window.setTimeout(() => void pollWeixinStatus(qrcode), 3000);
+      const nextStatus = data.status === 'wait' ? 'waiting' : data.status === 'scaned_but_redirect' ? 'scaned' : data.status;
+      setWeixinQr((current) => ({ ...current, status: nextStatus, qrcode }));
+      weixinPollRef.current = window.setTimeout(() => void pollWeixinStatus(qrcode, attempt), 3000);
     } catch (err: any) {
-      setWeixinQr({ status: 'error', qrcode, error: err.message || '微信扫码状态读取失败' });
+      if (attempt !== weixinAttemptRef.current) return;
+      setWeixinQr((current) => ({ ...current, status: 'error', qrcode, error: err.message || '微信扫码状态读取失败' }));
     }
   }
 
   async function startWeixinQrLogin() {
     if (weixinPollRef.current) window.clearTimeout(weixinPollRef.current);
+    weixinPollRef.current = null;
+    const attempt = weixinAttemptRef.current + 1;
+    weixinAttemptRef.current = attempt;
     setWeixinQr({ status: 'loading' });
     setError('');
     try {
       const data = await requestJson<{ qrcode: string; qrcode_url: string }>('/api/hermes/weixin/qrcode');
-      if (data.qrcode_url) window.open(data.qrcode_url, '_blank', 'noopener,noreferrer');
-      setWeixinQr({ status: 'waiting', qrcode: data.qrcode });
-      void pollWeixinStatus(data.qrcode);
+      if (attempt !== weixinAttemptRef.current) return;
+      if (!data.qrcode_url) throw new Error('微信二维码内容为空');
+      setWeixinQr({ status: 'waiting', qrcode: data.qrcode, qrcodeUrl: data.qrcode_url });
+      void pollWeixinStatus(data.qrcode, attempt);
     } catch (err: any) {
+      if (attempt !== weixinAttemptRef.current) return;
       setWeixinQr({ status: 'error', error: err.message || '微信二维码获取失败' });
     }
   }
 
   return (
+    <>
     <section className={embedded ? 'embedded-management-page channels-page' : 'management-page channels-page'}>
       <div className="studio-toolbar settings-head">
         <div><h2>频道</h2></div>
@@ -4777,6 +4836,8 @@ function ChannelsPage({ profiles, defaultProfile, embedded = false }: { profiles
         </div>
       )}
     </section>
+    {weixinQr.status !== 'idle' && <WeixinQrDialog state={weixinQr} onClose={closeWeixinQrLogin} onRetry={() => void startWeixinQrLogin()} />}
+    </>
   );
 }
 
