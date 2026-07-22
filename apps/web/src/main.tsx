@@ -533,9 +533,11 @@ type UsageTrendPoint = { key: string; label: string; requests: number; inputToke
 type ModelMetricRow = { key: string; provider: string; modelName: string; requests: number; realTotalTokens: number; totalCost: number; share: number; color: string };
 type DonutMetricRow = { key: string; modelName: string; requests: number; realTotalTokens: number; totalCost: number; share: number; displayShare: number; color: string };
 type ModuleUsageRow = { name: string; category?: string; profiles?: number; enabledProfiles?: number; useCount: number; viewCount: number; patchCount: number; lastUsedAt?: string | null };
+type ModelRunDiagnostic = { id: string; runId?: string; createdAt: string; updatedAt?: string; completedAt?: string; agentName?: string; profileName?: string; provider: string; providerKey?: string; model: string; transport: string; requestedReasoning: string; effectiveReasoning: string; requestedServiceTier: string; effectiveServiceTier: string; mappedParameters?: Record<string, unknown>; status: 'starting' | 'sent' | 'completed' | 'failed' | 'cancelled'; evidenceStatus: 'pending' | 'confirmed' | 'unconfirmed' | 'not_applicable'; reasoningTokens?: number; confirmedServiceTier?: string; durationMs?: number; error?: string };
 type MonitoringSummary = {
   checkedAt: string;
   logs: MonitoringLog[];
+  modelRuns: ModelRunDiagnostic[];
   usage: { totalRequests: number; totalTokens: number; realTotalTokens: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; totalCost: number; cacheHitRate: number; estimatedRequests: number; byModel: ModelUsageRow[]; byDay: UsageDay[]; bySource: UsageSource[]; byProfile?: UsageProfile[]; entries?: UsageEntry[]; recent: Array<ModelUsageRow & { createdAt?: string; agentNames?: string[]; threadTitle?: string }> };
   hermesStudio?: { databaseExists: boolean; roomCount: number; sessionCount: number; usageRowCount?: number; usageSource?: string };
   hermesAgent?: { databaseCount: number; usageRowCount: number; usageSource: string; profiles: Array<{ profileName: string; dbPath: string; sessionCount: number }> };
@@ -5829,6 +5831,10 @@ function PermissionModeControl({ value, onChange }: { value: PermissionMode; onC
   );
 }
 
+function modelRunReasoningLabel(value: string) {
+  return ({ off: '关闭', none: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最大', ultra: '极致' } as Record<string, string>)[value] || value;
+}
+
 function MonitoringPage({ embedded = false }: { embedded?: boolean }) {
   const [summary, setSummary] = useState<MonitoringSummary | null>(null);
   const [moduleMode, setModuleMode] = useState<'skills' | 'plugins'>('skills');
@@ -5906,6 +5912,7 @@ function MonitoringPage({ embedded = false }: { embedded?: boolean }) {
   }, [refreshMode]);
 
   const modules = moduleMode === 'skills' ? summary?.modules.skills : summary?.modules.plugins;
+  const modelRuns = summary?.modelRuns || [];
   return (
     <section className={embedded ? 'embedded-management-page monitoring-page' : 'settings-page monitoring-page'}>
       <div className="monitoring-shell">
@@ -6046,6 +6053,36 @@ function MonitoringPage({ embedded = false }: { embedded?: boolean }) {
           ))}
           {!filteredModels.length && <p className="muted-copy">还没有匹配的模型调用记录。发起一次真实模型对话后这里会开始累计。</p>}
         </div>
+      </section>
+
+      <section className="monitor-panel model-run-diagnostics-panel">
+        <details>
+          <summary>
+            <span><Activity size={15} /><strong>模型运行记录</strong><small>用于排查参数是否送达，不展示对话内容</small></span>
+            <span className="model-run-count">最近 {Math.min(modelRuns.length, 200)} 条<ChevronDown size={15} /></span>
+          </summary>
+          <div className="model-run-list">
+            {modelRuns.slice(0, 30).map((run) => (
+              <details className={`model-run-row ${run.status}`} key={run.id}>
+                <summary>
+                  <i aria-hidden="true" />
+                  <span><strong>{run.provider || run.providerKey || '未命名 Provider'} · {run.model || '未识别模型'}</strong><small>{new Date(run.createdAt).toLocaleString('zh-CN')} · {run.profileName || run.agentName || '默认 Profile'}</small></span>
+                  <span className="model-run-settings">{run.effectiveReasoning === 'default' ? '默认推理' : `${modelRunReasoningLabel(run.effectiveReasoning)}推理`} · {run.effectiveServiceTier === 'standard' ? '标准速度' : '快速线路'}</span>
+                  <em>{run.status === 'completed' ? (run.evidenceStatus === 'confirmed' ? '供应商已确认' : '已发送，供应商未确认') : run.status === 'failed' ? '运行失败' : run.status === 'cancelled' ? '已停止' : '发送中'}</em>
+                </summary>
+                <div className="model-run-detail">
+                  <span>Transport：{run.transport}</span>
+                  <span>耗时：{run.durationMs ? `${(run.durationMs / 1000).toFixed(1)}s` : '—'}</span>
+                  <span>推理回执：{run.reasoningTokens ? `${run.reasoningTokens} tokens` : '未返回'}</span>
+                  <span>速度回执：{run.confirmedServiceTier || '未返回'}</span>
+                  {run.error && <p>{run.error}</p>}
+                  {run.mappedParameters && Object.keys(run.mappedParameters).length > 0 && <pre>{JSON.stringify(run.mappedParameters, null, 2)}</pre>}
+                </div>
+              </details>
+            ))}
+            {!modelRuns.length && <p className="muted-copy">还没有模型运行记录。发起一次真实对话后，这里会显示脱敏后的参数送达状态。</p>}
+          </div>
+        </details>
       </section>
 
       <div className="monitor-grid">

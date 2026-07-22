@@ -61,6 +61,19 @@ class RunOverrideTests(unittest.TestCase):
         self.assertEqual(agent.service_tier, "auto")
         self.assertEqual(agent.request_overrides, {"existing": True, "speed": "old"})
 
+    def test_deepseek_thinking_stays_nested_in_extra_body(self) -> None:
+        agent = _Agent()
+        with _temporary_run_overrides(agent, runtime_overrides={
+            "request_overrides": {
+                "reasoning_effort": "max",
+                "extra_body": {"thinking": {"type": "enabled"}},
+            },
+        }):
+            self.assertNotIn("thinking", agent.request_overrides)
+            self.assertEqual(agent.request_overrides["reasoning_effort"], "max")
+            self.assertEqual(agent.request_overrides["extra_body"], {"thinking": {"type": "enabled"}})
+        self.assertEqual(agent.request_overrides, {"existing": True, "speed": "old"})
+
 
 if __name__ == "__main__":
     unittest.main()

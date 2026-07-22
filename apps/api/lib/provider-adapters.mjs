@@ -207,12 +207,18 @@ function safeOverrides(value) {
   return result;
 }
 
+export function directHttpRequestOverrides(value) {
+  const overrides = safeOverrides(value);
+  const { extra_body: extraBody, ...direct } = overrides;
+  return { ...direct, ...(extraBody && typeof extraBody === 'object' && !Array.isArray(extraBody) ? extraBody : {}) };
+}
+
 function chatReasoningOverrides(format, mapped) {
   if (!mapped) return {};
   if (format === 'openrouter') return { reasoning: { effort: mapped } };
   if (format === 'deepseek') return mapped === 'none'
-    ? { thinking: { type: 'disabled' } }
-    : { thinking: { type: 'enabled' }, reasoning_effort: mapped };
+    ? { extra_body: { thinking: { type: 'disabled' } } }
+    : { extra_body: { thinking: { type: 'enabled' } }, reasoning_effort: mapped };
   if (format === 'together') return { reasoning_effort: mapped };
   if (format === 'zai') return { thinking: { type: mapped === 'none' ? 'disabled' : 'enabled' } };
   if (format === 'qwen') return { enable_thinking: mapped !== 'none' };

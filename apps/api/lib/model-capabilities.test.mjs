@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mapRunSettings, normalizeCapabilityOverrides, resolveModelCapability } from './model-capabilities.mjs';
+import { directHttpRequestOverrides } from './provider-adapters.mjs';
 import { BUILTIN_CATALOG_META, candidateModelUrls, catalogKey } from './provider-adapters.mjs';
 
 function model(overrides = {}) {
@@ -80,7 +81,7 @@ test('Pi-style reasoning map preserves supported, unsupported and missing levels
 test('chat adapters map DeepSeek, Z.AI and Qwen explicitly', () => {
   const capability = { reasoningMap: { high: 'high' }, serviceTiers: [], modelId: 'vendor' };
   const mapped = (thinkingFormat) => mapRunSettings(model({ compat: { thinkingFormat }, apiMode: 'chat_completions' }), capability, { reasoningEffort: 'high' }).runtimeOverrides.request_overrides;
-  assert.deepEqual(mapped('deepseek'), { thinking: { type: 'enabled' }, reasoning_effort: 'high' });
+  assert.deepEqual(mapped('deepseek'), { extra_body: { thinking: { type: 'enabled' } }, reasoning_effort: 'high' });
   assert.deepEqual(mapped('zai'), { thinking: { type: 'enabled' } });
   assert.deepEqual(mapped('qwen'), { enable_thinking: true });
 });
@@ -94,10 +95,11 @@ test('official DeepSeek auto mode disables thinking without an invalid none effo
   const disabled = mapRunSettings(provider, capability, { reasoningEffort: 'off' }).runtimeOverrides.request_overrides;
   const high = mapRunSettings(provider, capability, { reasoningEffort: 'high' }).runtimeOverrides.request_overrides;
   const max = mapRunSettings(provider, capability, { reasoningEffort: 'max' }).runtimeOverrides.request_overrides;
-  assert.deepEqual(disabled, { thinking: { type: 'disabled' } });
+  assert.deepEqual(disabled, { extra_body: { thinking: { type: 'disabled' } } });
   assert.equal('reasoning_effort' in disabled, false);
-  assert.deepEqual(high, { thinking: { type: 'enabled' }, reasoning_effort: 'high' });
-  assert.deepEqual(max, { thinking: { type: 'enabled' }, reasoning_effort: 'max' });
+  assert.deepEqual(high, { extra_body: { thinking: { type: 'enabled' } }, reasoning_effort: 'high' });
+  assert.deepEqual(max, { extra_body: { thinking: { type: 'enabled' } }, reasoning_effort: 'max' });
+  assert.deepEqual(directHttpRequestOverrides(max), { thinking: { type: 'enabled' }, reasoning_effort: 'max' });
 });
 
 test('custom relays and manual mode do not inherit the official DeepSeek adapter', () => {

@@ -23,7 +23,8 @@ import { isSystemHermesProfile, resolveDeletableHermesProfileDir, userVisibleHer
 import { resolveInsideRoot } from './lib/path-boundary.mjs';
 import { resolveCommand as resolvePlatformCommand, runtimePlatformDir } from './lib/platform.mjs';
 import { capabilitiesForModels, mapRunSettings, normalizeCapabilityOverrides, resolveModelCapability } from './lib/model-capabilities.mjs';
-import { CHAT_THINKING_FORMATS, candidateModelUrls } from './lib/provider-adapters.mjs';
+import { createModelRunDiagnostic, finishModelRunDiagnostic, markModelRunSent } from './lib/model-run-diagnostics.mjs';
+import { CHAT_THINKING_FORMATS, candidateModelUrls, directHttpRequestOverrides } from './lib/provider-adapters.mjs';
 import { catalogStatus, flattenProviderCatalog, parseCatalogResponse, parseModelIds, readCatalogCache, recordActiveProbeCapability, recordCatalogError, updateProviderCatalog, verificationKey, writeCatalogCache } from './lib/model-catalog-store.mjs';
 import { extractChatGptAccountId, fetchCodexOAuthCatalog } from './lib/oauth-provider-catalog.mjs';
 import { runtimeStep, summarizeRuntimeAutoStart } from './lib/runtime-autostart.mjs';
@@ -764,7 +765,7 @@ function defaultState() {
     version: 2,
     ui: { libraryCollapsed: false, pinnedNav: defaultPinnedNav, defaultAgentId: '', defaultModel: '', density: 'comfortable', streamingResponses: true, showReasoning: true, telemetryEnabled: false, telemetryNoticeSeenAt: '' },
     userProfile: { avatarUrl: '', nickname: '', bio: '', age: '', hobbies: '', occupation: '', defaultAgentAddress: '', otherAgentAddress: '', completedAt: '', updatedAt: '' },
-    observability: { modelUsage: [], systemEvents: [] },
+    observability: { modelUsage: [], modelRuns: [], systemEvents: [] },
     integrations: {
       hermesStudio: {
         detectedUrl: '',
@@ -998,6 +999,7 @@ function normalizeState(state) {
     userProfile: normalizeUserProfile(state.userProfile || base.userProfile),
     observability: {
       modelUsage: Array.isArray(state.observability?.modelUsage) ? state.observability.modelUsage.slice(-800) : [],
+      modelRuns: Array.isArray(state.observability?.modelRuns) ? state.observability.modelRuns.slice(-200) : [],
       systemEvents: Array.isArray(state.observability?.systemEvents) ? state.observability.systemEvents.slice(-400) : [],
     },
     spaces: normalizedSpaces,
@@ -8004,10 +8006,11 @@ app.post('/api/models/:id/verify', async (req, res) => {
 
     const mapped = mapRunSettings(verificationModel, capability, { reasoningEffort: req.body?.reasoningEffort, serviceTier: req.body?.serviceTier || req.body?.speedMode });
     const requestOverrides = mapped.runtimeOverrides.request_overrides || {};
+    const expandedRequestOverrides = directHttpRequestOverrides(requestOverrides);
     let body;
-    if (verificationModel.apiMode === 'anthropic_messages') body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...requestOverrides };
-    else if (verificationModel.apiMode === 'codex_responses' || verificationModel.apiMode === 'openai_responses') body = { model: modelId, input: 'Reply OK.', max_output_tokens: 8, ...(mapped.runtimeOverrides.reasoning_config ? { reasoning: mapped.runtimeOverrides.reasoning_config } : {}), ...(mapped.runtimeOverrides.service_tier ? { service_tier: mapped.runtimeOverrides.service_tier } : {}), ...requestOverrides };
-    else body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...requestOverrides };
+    if (verificationModel.apiMode === 'anthropic_messages') body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...expandedRequestOverrides };
+    else if (verificationModel.apiMode === 'codex_responses' || verificationModel.apiMode === 'openai_responses') body = { model: modelId, input: 'Reply OK.', max_output_tokens: 8, ...(mapped.runtimeOverrides.reasoning_config ? { reasoning: mapped.runtimeOverrides.reasoning_config } : {}), ...(mapped.runtimeOverrides.service_tier ? { service_tier: mapped.runtimeOverrides.service_tier } : {}), ...expandedRequestOverrides };
+    else body = { model: modelId, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 8, ...expandedRequestOverrides };
     const result = await fetchExternalJson(providerInferenceUrl(verificationModel), { method: 'POST', headers, body: JSON.stringify(body), timeoutMs: 30000 });
     if (!result.ok) {
       const message = String(result.body?.error?.message || `HTTP ${result.status}`).slice(0, 500);
@@ -8656,6 +8659,7 @@ app.get('/api/monitoring/summary', async (_req, res) => {
     res.json({
       checkedAt: now(),
       logs,
+      modelRuns: (state.observability?.modelRuns || []).slice(-200).reverse(),
       usage: aggregateModelUsage(usageRows, state.models || []),
       hermesStudio: { databaseExists: hermesDb.exists, roomCount: hermesDb.rooms.length, sessionCount: hermesDb.sessions.length, usageRowCount: hermesUsageRows.length, usageSource: 'legacy hermes-web-ui db' },
       hermesAgent: hermesUsage.meta,
@@ -9780,6 +9784,42 @@ function writeHermesRunSse(res, event) {
   res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
+function ensureModelRunDiagnostics(state) {
+  state.observability = state.observability || { modelUsage: [], modelRuns: [], systemEvents: [] };
+  state.observability.modelRuns = Array.isArray(state.observability.modelRuns) ? state.observability.modelRuns : [];
+  return state.observability.modelRuns;
+}
+
+function appendModelRunDiagnostic(state, record) {
+  const records = ensureModelRunDiagnostics(state);
+  records.push(record);
+  state.observability.modelRuns = records.slice(-200);
+  return record;
+}
+
+function updateModelRunDiagnostic(state, { diagnosticId = '', runId = '', threadId = '' }, update) {
+  const records = ensureModelRunDiagnostics(state);
+  let index = diagnosticId ? records.findIndex((record) => record.id === diagnosticId) : -1;
+  if (index < 0 && runId) index = records.findIndex((record) => record.runId === runId);
+  if (index < 0 && threadId) {
+    for (let cursor = records.length - 1; cursor >= 0; cursor -= 1) {
+      if (records[cursor].threadId === threadId && ['starting', 'sent'].includes(records[cursor].status)) {
+        index = cursor;
+        break;
+      }
+    }
+  }
+  if (index < 0) return null;
+  records[index] = update(records[index]);
+  state.observability.modelRuns = records.slice(-200);
+  return records[index];
+}
+
+function finishStoredModelRun(state, { diagnosticId = '', runId = '', threadId = '', status, usage = {}, error = '' }) {
+  const completedAt = now();
+  return updateModelRunDiagnostic(state, { diagnosticId, runId, threadId }, (record) => finishModelRunDiagnostic(record, { status, completedAt, usage, error }));
+}
+
 function clearHermesRunState(thread) {
   thread.activeRunId = '';
   thread.activeSessionId = '';
@@ -9826,6 +9866,7 @@ async function failHermesRunFromChunk(threadId, runId, errorMessage, res) {
   const telemetryProperties = runTelemetryProperties(thread);
   if (thread) {
     thread.runStatus = 'failed';
+    finishStoredModelRun(state, { runId, threadId, status: 'failed', error: event.error });
     clearHermesRunState(thread);
     thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'failed'), stepFromHermesEvent(event));
     thread.workflow = thread.workflowState.map((step) => step.title);
@@ -9873,6 +9914,12 @@ async function processHermesBridgeChunk({ threadId, runId, chunk, res, outputSta
       const telemetryProperties = runTelemetryProperties(thread);
       if (thread) {
         thread.runStatus = event.event === 'run.failed' ? 'failed' : 'idle';
+        finishStoredModelRun(state, {
+          runId,
+          threadId,
+          status: event.event === 'run.failed' ? 'failed' : 'cancelled',
+          error: event.error || (event.event === 'run.cancelled' ? '用户已停止运行。' : ''),
+        });
         clearHermesRunState(thread);
         thread.workflowState = closeOpenWorkflowSteps(thread.workflowState || [], event.event === 'run.failed' ? 'failed' : 'completed');
         thread.workflow = thread.workflowState.map((step) => step.title);
@@ -9941,6 +9988,7 @@ async function appendHermesRunResult(threadId, output, runId, usage = {}) {
   thread.externalSessionId = thread.externalSessionId || `workbench-${thread.id}`;
   thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'completed'), { title: '生成最终回复', status: 'completed', source: 'run', updatedAt: now() });
   thread.workflow = thread.workflowState.map((step) => step.title);
+  finishStoredModelRun(state, { runId, threadId, status: 'completed', usage });
   if (usage?.total_tokens) {
     state.observability = state.observability || { modelUsage: [], systemEvents: [] };
     state.observability.modelUsage = Array.isArray(state.observability.modelUsage) ? state.observability.modelUsage : [];
@@ -10005,6 +10053,7 @@ async function failHermesRun(threadId, runId, errorMessage, title = 'Hermes Agen
   const thread = state.threads.find((item) => item.id === threadId);
   if (thread) {
     thread.runStatus = 'failed';
+    finishStoredModelRun(state, { runId, threadId, status: 'failed', error: errorMessage });
     clearHermesRunState(thread);
     thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'failed'), { title, status: 'failed', source: 'run', detail: String(errorMessage || '').slice(0, 200), updatedAt: now() });
     thread.workflow = thread.workflowState.map((step) => step.title);
@@ -10062,6 +10111,7 @@ async function healStaleRunningThreads(state) {
 
 app.post('/api/threads/:id/runs', async (req, res) => {
   let runProfileName = 'default';
+  let runDiagnosticId = '';
   try {
     const state = await readState();
     const thread = state.threads.find((item) => item.id === req.params.id);
@@ -10131,6 +10181,17 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     thread.profileName = profileName;
     thread.bridgeEndpoint = bridge.endpoint;
     thread.updatedAt = now();
+    runDiagnosticId = id('model_run');
+    appendModelRunDiagnostic(state, createModelRunDiagnostic({
+      id: runDiagnosticId,
+      createdAt: thread.activeRunStartedAt,
+      thread,
+      agent: primaryAgent,
+      profileName,
+      runModel,
+      runCapability,
+      runMapping,
+    }));
     await writeState(state);
 
     const bridgeAttachments = await Promise.all(attachmentMetadata.map(async (metadata) => {
@@ -10155,15 +10216,17 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     });
     const stateAfterStart = await readState();
     const threadAfterStart = stateAfterStart.threads.find((item) => item.id === req.params.id);
+    const sentAt = now();
+    updateModelRunDiagnostic(stateAfterStart, { diagnosticId: runDiagnosticId }, (record) => markModelRunSent(record, started.run_id, sentAt));
     if (threadAfterStart) {
       threadAfterStart.activeRunId = started.run_id;
       threadAfterStart.activeSessionId = started.session_id || sessionId;
       threadAfterStart.activeRunAgentId = primaryAgent.id;
       threadAfterStart.activeRunMentionedAgentId = explicitlyMentionedPrimaryAgent ? primaryAgent.id : '';
       threadAfterStart.activeRunRouteReason = explicitlyMentionedPrimaryAgent ? 'user_mention' : thread.followMode === 'conversation' ? 'conversation_follow' : 'default_agent';
-      threadAfterStart.updatedAt = now();
-      await writeState(stateAfterStart);
+      threadAfterStart.updatedAt = sentAt;
     }
+    await writeState(stateAfterStart);
     captureTelemetry('agent_run_started', {
       agent_count: selectedAgentIds.length,
       attachment_count: attachmentMetadata.length,
@@ -10195,14 +10258,15 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     try {
       const state = await readState();
       const thread = state.threads.find((item) => item.id === req.params.id);
+      finishStoredModelRun(state, { diagnosticId: runDiagnosticId, threadId: req.params.id, status: 'failed', error: enriched });
       if (thread?.runStatus === 'running') {
         thread.runStatus = 'failed';
         clearHermesRunState(thread);
         thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'failed'), { title: 'Hermes Agent 启动失败', status: 'failed', source: 'run', detail: enriched.slice(0, 200), updatedAt: now() });
         thread.workflow = thread.workflowState.map((step) => step.title);
         thread.updatedAt = now();
-        await writeState(state);
       }
+      await writeState(state);
     } catch {}
     captureTelemetry('agent_run_failed', { stage: 'startup', error_code: telemetryErrorCode(error) });
     res.status(error.status || 500).json({ error: enriched, code: error.code || details.errorType || '', details });
@@ -10250,6 +10314,7 @@ app.get('/api/threads/:id/runs/:runId/events', async (req, res) => {
       const thread = state.threads.find((item) => item.id === req.params.id);
       if (thread) {
         thread.runStatus = 'failed';
+        finishStoredModelRun(state, { runId: req.params.runId, threadId: req.params.id, status: 'failed', error: formattedError });
         clearHermesRunState(thread);
         thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'failed'), { title: 'Hermes Agent 运行失败', status: 'failed', source: 'run', detail: formattedError.slice(0, 200), updatedAt: now() });
         thread.workflow = thread.workflowState.map((step) => step.title);
