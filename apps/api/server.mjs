@@ -9409,9 +9409,11 @@ async function resolveThreadRunModelConfig(state, thread, agent, profileName) {
     }
     return { model, provider, source: 'profile', modelProfile: null };
   }
-  const fallback = resolveModelSelection(agent?.model || '', state.models || []);
+  const fallbackValue = agent?.model || state.ui?.defaultModel || state.models?.[0]?.id || state.models?.[0]?.model || '';
+  const fallback = resolveModelSelection(fallbackValue, state.models || []);
   if (fallback.selectedModel) {
-    const materialized = await ensureModelProviderForProfile(profileName, fallback.selectedModel, fallback.selectedName, state.models || [], { setDefault: false });
+    const materialized = await ensureModelProviderForProfile(profileName, fallback.selectedModel, fallback.selectedName, state.models || [], { setDefault: true });
+    if (agent && !agent.model) agent.model = fallback.selectedName;
     return { model: materialized.model, provider: materialized.provider, source: 'agent', modelProfile: fallback.selectedModel };
   }
   return { model: '', provider: '', source: 'profile', modelProfile: null };

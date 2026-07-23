@@ -116,6 +116,50 @@ test('creating a model-less Agent writes no implicit model and persists gateway 
   assert.equal(replayState.agents.length, 1);
 });
 
+test('assigning the first configured model materializes its provider in the Hermes Profile', async (t) => {
+  const ctx = await startTestApp(t, 'frakio-profile-model-sync-');
+  const jsonHeaders = { ...ctx.writeHeaders, 'content-type': 'application/json' };
+  const agentResponse = await fetch(`${ctx.baseUrl}/api/agents`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ name: 'Mark', role: '测试', requestId: 'create-mark-model-sync' }),
+  });
+  assert.equal(agentResponse.status, 200);
+  const modelResponse = await fetch(`${ctx.baseUrl}/api/models`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({
+      name: 'DeepSeek',
+      provider: 'DeepSeek',
+      providerKey: 'deepseek',
+      kind: 'official',
+      protocol: 'OpenAI Compatible',
+      apiMode: 'chat_completions',
+      baseUrl: 'https://api.deepseek.com',
+      apiKey: 'test-deepseek-key',
+      model: 'deepseek-v4-flash',
+      models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+    }),
+  });
+  assert.equal(modelResponse.status, 200);
+  const model = (await modelResponse.json()).model;
+  const assignResponse = await fetch(`${ctx.baseUrl}/api/agents/mark`, {
+    method: 'PATCH',
+    headers: jsonHeaders,
+    body: JSON.stringify({ model: `${model.id}::deepseek-v4-flash` }),
+  });
+  assert.equal(assignResponse.status, 200);
+  const assigned = await assignResponse.json();
+  assert.equal(assigned.agent.model, 'deepseek-v4-flash');
+  const profileDir = path.join(ctx.hermesHome, 'profiles', 'mark');
+  const config = await readFile(path.join(profileDir, 'config.yaml'), 'utf8');
+  const env = await readFile(path.join(profileDir, '.env'), 'utf8');
+  assert.match(config, /provider: deepseek/);
+  assert.match(config, /default: deepseek-v4-flash/);
+  assert.match(env, /^DEEPSEEK_API_KEY=/m);
+  assert.match(env, /^DEEPSEEK_BASE_URL=https:\/\/api\.deepseek\.com/m);
+});
+
 test('legacy cleanup removes only untouched built-in content and creates an idempotent backup marker', async (t) => {
   const parent = await mkdtemp(path.join(os.tmpdir(), 'frakio-legacy-cleanup-'));
   const home = path.join(parent, '.frakio-work');
