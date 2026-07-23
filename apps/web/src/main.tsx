@@ -8979,7 +8979,8 @@ function AgentProfileDetail({ agent, models, gateway, onChanged, onUpdateAgent, 
     }
   }
   async function saveAgentModel(modelValue: string) {
-    if (!modelValue || modelValue === modelValueForAgent(agent, models) || modelSaving) return;
+    const persistedModelValue = agent.model ? resolveModelChoice(agent.model, models).value : '';
+    if (!modelValue || modelValue === persistedModelValue || modelSaving) return;
     setModelError('');
     setModelSaving(true);
     try {

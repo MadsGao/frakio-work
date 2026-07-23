@@ -221,7 +221,15 @@ try {
   const destination = path.join(projectRoot, 'runtime', 'hermes', version, platform);
   await mkdir(path.dirname(destination), { recursive: true });
   await rm(destination, { recursive: true, force: true });
-  await rename(staging, destination);
+  try {
+    await rename(staging, destination);
+  } catch (error) {
+    if (process.platform !== 'win32' || !['EPERM', 'EBUSY', 'EACCES'].includes(error?.code)) throw error;
+    // Windows can briefly keep a self-test executable open after the runtime check.
+    // Copying the completed staging directory avoids losing an otherwise valid build.
+    await cp(staging, destination, { recursive: true, dereference: true, preserveTimestamps: true });
+    await rm(staging, { recursive: true, force: true }).catch(() => null);
+  }
   console.log(`Built standalone Hermes runtime: ${destination}`);
 } catch (error) {
   await rm(staging, { recursive: true, force: true }).catch(() => null);
