@@ -10212,7 +10212,9 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       runtime_overrides: runMapping.runtimeOverrides,
       source: 'frakio-workbench',
     }, {
-      timeoutMs: 30000,
+      // Cold-starting the bundled Python/Hermes worker can exceed 30s on Windows,
+      // especially on ARM machines running the x64 runtime under emulation.
+      timeoutMs: 120000,
       retryMs: 5000,
     });
     const stateAfterStart = await readState();
