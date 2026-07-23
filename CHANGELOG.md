@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6 Beta — 2026-07-23
+
+本版本集中修复 Windows 桌面版首次运行和冷启动问题。Agent 第一次选择模型时会自动把 Provider 配置同步到对应 Hermes Profile，避免界面已有模型但运行时提示未配置 Provider。Windows 构建在 Hermes Runtime 最终目录移动失败时会自动回退到完整复制，减少虚拟机和 Windows 文件占用导致的打包失败。
+
+Windows 桌面端发现旧 Hermes Bridge 时会先清理旧进程，再启动当前 API 所属的 Bridge，避免多个桌面进程共用失效 Bridge。Windows 冷启动内置 Python、Hermes Agent 和 Bridge 的等待时间调整为 120 秒，适配 Windows ARM 虚拟机运行 x64 Runtime 时较慢的首次加载。
+
 ## 0.1.5 Beta — 2026-07-22
 
 微信登录二维码现在直接显示在 Frakio Work 内，不再跳转到外部页面。登录弹窗会持续显示等待、已扫码和确认状态；二维码过期或读取失败时可以重新获取。关闭弹窗或切换 Profile 会立即停止旧轮询，避免已取消的登录请求继续写入当前配置。
