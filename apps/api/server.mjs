@@ -3087,10 +3087,9 @@ async function terminatePids(pids, logs, reason) {
 async function cleanupStaleHermesBridge(current, logs = []) {
   const endpoint = current?.endpoint || hermesBridgeEndpoint();
   if (process.env.HERMES_AGENT_BRIDGE_ENDPOINT) return;
-  if (!endpoint.startsWith('ipc://')) return;
   const pids = collectBridgePids(current?.ping || {});
   await terminatePids(pids, logs, 'stale Hermes Bridge');
-  await unlink(endpoint.slice('ipc://'.length)).catch(() => null);
+  if (endpoint.startsWith('ipc://')) await unlink(endpoint.slice('ipc://'.length)).catch(() => null);
 }
 
 async function probeHermesBridge(options = {}) {
@@ -3180,7 +3179,7 @@ async function startHermesBridge() {
   const logs = [];
   if (current.ready) {
     const owned = Boolean(current.ownedByThisApi);
-    const stale = Boolean(!process.env.HERMES_AGENT_BRIDGE_ENDPOINT && endpoint.startsWith('ipc://') && (!owned || current.startedBeforeApi));
+    const stale = Boolean(!process.env.HERMES_AGENT_BRIDGE_ENDPOINT && (!owned || current.startedBeforeApi));
     if (!stale) return { bridge: current, logs: ['Hermes Bridge already ready.'] };
     logs.push(`found stale Hermes Bridge broker pid=${current.brokerPid || 'unknown'} owner=${current.owner || 'unknown'}`);
     await cleanupStaleHermesBridge(current, logs);
