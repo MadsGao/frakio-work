@@ -165,7 +165,7 @@ type VaultSummary = {
   lastIndexedAt?: string;
   needsRefresh: boolean;
 };
-type ChatEvent = { id: string; agentId: string; agentName: string; role: string; content: string; attachments?: Attachment[]; reasoning?: string; externalRunId?: string };
+type ChatEvent = { id: string; agentId: string; agentName: string; role: string; content: string; attachments?: Attachment[]; reasoning?: string; externalRunId?: string; turnId?: string; mentionDepth?: number; parentMessageId?: string; routeReason?: string };
 type AttachmentDraft = { localId: string; file: File; previewUrl: string; status: 'uploading' | 'ready' | 'error'; attachment?: Attachment; error?: string };
 const attachmentAcceptValue = [
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.heic', '.svg', '.ico',
@@ -182,7 +182,7 @@ type WorkspaceFileEntry = { name: string; relativePath: string; kind: 'file' | '
 type WorkspaceFileContent = { name: string; relativePath: string; mimeKind: 'markdown' | 'text' | 'json' | 'code' | 'pdf' | 'image' | 'binary'; content?: string; size: number; updatedAt?: string; truncated: boolean };
 type WorkflowStep = { title: string; status: 'pending' | 'running' | 'completed' | 'failed'; source?: 'run' | 'tool' | 'approval' | 'clarify' | 'simulation'; agentName?: string; detail?: string; updatedAt?: string; callId?: string };
 type FollowMode = 'default' | 'conversation';
-type ThreadCollaboration = { kind: string; activeAgentId?: string | null; lastMentionedAgentId?: string | null; lastMentionedAgentName?: string; maxMentionDepth?: number; lastRoutedAt?: string | null; lastRouteReason?: string };
+type ThreadCollaboration = { kind: string; activeAgentId?: string | null; lastMentionedAgentId?: string | null; lastMentionedAgentName?: string; maxMentionDepth?: number | 'unlimited'; lastRoutedAt?: string | null; lastRouteReason?: string };
 type ContextPacket = {
   title: string;
   conversation: { userIntent: string; activeAgents: string[]; currentConclusion: string };
@@ -262,6 +262,7 @@ type WorkbenchUiSettings = {
   contextTriggerTokens?: number;
   groupChatTriggerTokens?: number;
   historyTailMessages?: number;
+  agentMentionMaxDepth?: number | 'unlimited';
   libraryCollapsed?: boolean;
   sidebarCollapsed?: boolean;
   sidebarWidth?: number;
@@ -347,7 +348,7 @@ type HermesRuntimeManager = {
 };
 type HermesRuntimeDiagnostics = {
   checkedAt: string;
-  workbenchApi: { online: boolean; url: string; pid: number; port: number };
+  workbenchApi: { online: boolean; url: string; pid: number; port: number; version?: string; buildTime?: string; buildFingerprint?: string; packaged?: boolean };
   frakioWorkHome?: { path: string; exists: boolean; apiHome?: string; runtimeHome?: string };
   hermesHome: { path: string; exists: boolean; configExists: boolean; profileCount: number; profileNames: string[] };
   agentRoot: { path: string; exists: boolean };
@@ -734,7 +735,7 @@ function App() {
   const [pinnedNav, setPinnedNav] = useState<PinnedNav>(() => Object.fromEntries(railNavItems.map((item) => [item.id, true])));
   const [userProfile, setUserProfile] = useState<UserProfile>({ avatarUrl: '', nickname: '', bio: '', age: '', hobbies: '', occupation: '', defaultAgentAddress: '', otherAgentAddress: '', completedAt: '', updatedAt: '' });
   const [userProfileLoaded, setUserProfileLoaded] = useState(false);
-  const [uiSettings, setUiSettings] = useState<WorkbenchUiSettings>({ sendKey: 'enter', density: 'comfortable', streamingResponses: true, showReasoning: true, defaultAgentId: '', defaultPermissionMode: 'manual', contextTriggerTokens: 500000, groupChatTriggerTokens: 100000, historyTailMessages: 10 });
+  const [uiSettings, setUiSettings] = useState<WorkbenchUiSettings>({ sendKey: 'enter', density: 'comfortable', streamingResponses: true, showReasoning: true, defaultAgentId: '', defaultPermissionMode: 'manual', contextTriggerTokens: 500000, groupChatTriggerTokens: 100000, historyTailMessages: 10, agentMentionMaxDepth: 2 });
   const [telemetryStatus, setTelemetryStatus] = useState<TelemetryStatus | null>(null);
   const [showTelemetryNotice, setShowTelemetryNotice] = useState(false);
   const [hermesStatus, setHermesStatus] = useState<HermesLocalStatus | null>(null);
@@ -1191,6 +1192,9 @@ function App() {
       contextTriggerTokens: Number(stateData?.ui?.contextTriggerTokens || 500000),
       groupChatTriggerTokens: Number(stateData?.ui?.groupChatTriggerTokens || 100000),
       historyTailMessages: Number(stateData?.ui?.historyTailMessages || 10),
+      agentMentionMaxDepth: stateData?.ui?.agentMentionMaxDepth === 'unlimited'
+        ? 'unlimited'
+        : Math.max(0, Math.floor(Number(stateData?.ui?.agentMentionMaxDepth ?? 2) || 0)),
       sidebarCollapsed: Boolean(stateData?.ui?.sidebarCollapsed),
       sidebarWidth: clampNumber(Number(stateData?.ui?.sidebarWidth || defaultSidebarWidth), sidebarWidthBounds.min, sidebarWidthBounds.max),
       contextWidth: clampNumber(Number(stateData?.ui?.contextWidth || defaultContextWidth), contextWidthBounds.min, contextWidthBounds.max),
@@ -2446,9 +2450,10 @@ function App() {
     setActiveHermesRun(null);
   }
 
-  async function runHermesAgentThread(threadId: string, text: string, selectedAgentsForRun: string[], startedAt: number, target: ChatRunTarget | null, runAttachments: Attachment[] = [], onAccepted?: () => void) {
+  async function runHermesAgentThread(threadId: string, text: string, selectedAgentsForRun: string[], startedAt: number, target: ChatRunTarget | null, runAttachments: Attachment[] = [], onAccepted?: () => void, relay?: { sourceAgentId: string; sourceAgentName: string; mentionDepth: number; parentMessageId: string; turnId: string }): Promise<Thread | null> {
     resetRunUi();
     const userDraftMessage: ChatEvent = { id: `local-user-${startedAt}`, agentId: 'user', agentName: '你', role: 'Workspace Owner', content: text, attachments: runAttachments };
+    let completedThread: Thread | null = null;
     const appendMissingRunMessages = (thread: Thread, runId: string, assistantDraft = '') => {
       let nextMessages = [...thread.messages];
       const attachmentIds = runAttachments.map((attachment) => attachment.id).sort().join(',');
@@ -2457,7 +2462,7 @@ function App() {
         && message.content.trim() === text.trim()
         && (message.attachments || []).map((attachment) => attachment.id).sort().join(',') === attachmentIds
       ));
-      if (!hasUserMessage) nextMessages = [...nextMessages, userDraftMessage];
+      if (!relay && !hasUserMessage) nextMessages = [...nextMessages, userDraftMessage];
       const finalDraft = assistantDraft.trim();
       const hasAssistantResult = nextMessages.some((message) => (
         message.agentId !== 'user'
@@ -2484,7 +2489,7 @@ function App() {
     const createRes = await fetch(`/api/threads/${threadId}/runs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, attachmentIds: runAttachments.map((attachment) => attachment.id), selectedAgents: selectedAgentsForRun, targetAgentId: target?.kind === 'agent' ? target.agent.id : '' }),
+      body: JSON.stringify({ message: text, attachmentIds: runAttachments.map((attachment) => attachment.id), selectedAgents: selectedAgentsForRun, targetAgentId: target?.kind === 'agent' ? target.agent.id : '', turnId: relay?.turnId || `turn-${startedAt}`, ...(relay ? { ...relay } : {}) }),
     });
     const created = await createRes.json().catch(() => ({}));
     if (!createRes.ok) {
@@ -2617,6 +2622,7 @@ function App() {
               && message.content.trim()
             ));
             const nextThread = appendMissingRunMessages(threadFromServer, run.runId, hasAssistantResult ? '' : streamedDraft);
+            completedThread = nextThread;
             setActiveThread(nextThread);
             const lastMessage = nextThread.messages.filter(isVisibleChatMessage).at(-1);
             setCompletedRunSummary({
@@ -2641,6 +2647,7 @@ function App() {
         }
       };
     });
+    return completedThread;
   }
 
   async function approveActiveRun(choice: 'once' | 'session' | 'always' | 'deny') {
@@ -3059,6 +3066,7 @@ function App() {
     const target = resolveRunTarget(text, agents, activeComposerAgent);
     setRunTarget(target);
     setCompletedRunSummary(null);
+    const turnMentionMaxDepth = uiSettings.agentMentionMaxDepth === 'unlimited' ? 'unlimited' : Math.max(0, Math.floor(Number(uiSettings.agentMentionMaxDepth ?? 2)));
     const optimisticThread = {
       ...activeThread,
       messages: [...activeThread.messages, { id: `local-user-${startedAt}`, agentId: 'user', agentName: '你', role: 'Workspace Owner', content: text, attachments: runAttachments }],
@@ -3067,10 +3075,62 @@ function App() {
     let runAccepted = false;
     try {
       try {
-        await runHermesAgentThread(activeThread.id, text, selectedAgentIds, startedAt, target, runAttachments, () => {
+        const turnId = `turn-${startedAt}`;
+        let routedAgentIds = [...selectedAgentIds];
+        let routedThread = await runHermesAgentThread(activeThread.id, text, routedAgentIds, startedAt, target, runAttachments, () => {
           runAccepted = true;
           clearAttachmentDrafts();
         });
+        const initialMentionedAgents = resolveMentionedRunAgents(text, agents, routedAgentIds);
+        let currentWave = routedThread ? [routedThread.messages.filter((message) => message.agentId !== 'user' && message.agentId !== 'system').at(-1)].filter(Boolean) as ChatEvent[] : [];
+        let totalRoutedRuns = currentWave.length;
+        const rootAgentId = currentWave[0]?.agentId || (target?.kind === 'agent' ? target.agent.id : '');
+
+        for (const mentionedAgent of initialMentionedAgents) {
+          if (mentionedAgent.id === rootAgentId || totalRoutedRuns >= 64) continue;
+          routedAgentIds = Array.from(new Set([...routedAgentIds, mentionedAgent.id]));
+          setRunTarget({ kind: 'agent', agent: mentionedAgent });
+          const nextThread = await runHermesAgentThread(activeThread.id, text, routedAgentIds, startedAt, { kind: 'agent', agent: mentionedAgent }, [], undefined, {
+            sourceAgentId: 'user', sourceAgentName: '你', mentionDepth: 0, parentMessageId: optimisticThread.messages.at(-1)?.id || '', turnId,
+          });
+          const reply = nextThread?.messages.filter((message) => message.agentId === mentionedAgent.id).at(-1);
+          if (nextThread) routedThread = nextThread;
+          if (reply) currentWave.push(reply);
+          totalRoutedRuns += 1;
+        }
+
+        const routedEdges = new Set<string>();
+        let mentionDepth = 1;
+        while (routedThread && currentWave.length && totalRoutedRuns < 64 && (turnMentionMaxDepth === 'unlimited' || mentionDepth <= turnMentionMaxDepth)) {
+          const nextTargets = new Map<string, { agent: Agent; source: ChatEvent }>();
+          for (const source of currentWave) {
+            const targets = resolveMentionedRunAgents(source.content, agents, routedAgentIds, source.agentId);
+            for (const mentionedAgent of targets) {
+              const edge = `${source.agentId}->${mentionedAgent.id}`;
+              if (routedEdges.has(edge)) continue;
+              routedEdges.add(edge);
+              nextTargets.set(mentionedAgent.id, { agent: mentionedAgent, source });
+            }
+          }
+          if (!nextTargets.size) break;
+          const nextWave: ChatEvent[] = [];
+          for (const { agent: mentionedAgent, source } of nextTargets.values()) {
+            if (totalRoutedRuns >= 64) break;
+            routedAgentIds = Array.from(new Set([...routedAgentIds, mentionedAgent.id]));
+            setRunTarget({ kind: 'agent', agent: mentionedAgent });
+            const routedText = stripAgentMentionTokens(source.content, mentionedAgent) || source.content;
+            const relayText = `群聊系统：${source.agentName} 在对话中提及了你（${mentionedAgent.name}），请基于当前上下文直接回复。\n\n原始消息：${routedText}`;
+            const nextThread = await runHermesAgentThread(activeThread.id, relayText, routedAgentIds, startedAt, { kind: 'agent', agent: mentionedAgent }, [], undefined, {
+              sourceAgentId: source.agentId, sourceAgentName: source.agentName, mentionDepth, parentMessageId: source.id, turnId,
+            });
+            const reply = nextThread?.messages.filter((message) => message.agentId === mentionedAgent.id).at(-1);
+            if (nextThread) routedThread = nextThread;
+            if (reply) nextWave.push(reply);
+            totalRoutedRuns += 1;
+          }
+          currentWave = nextWave;
+          mentionDepth += 1;
+        }
       } catch (error) {
         if (!runAccepted) setInput((current) => current || text);
         setRunError(error instanceof Error ? error.message : '本机 Hermes Bridge 未连接。');
@@ -7113,6 +7173,8 @@ function HermesRuntimePanel({ runtime, bootstrap, localStatus, diagnostics, apiA
       </div>
       {diagnostics && <div className="runtime-diagnostics">
         <span><strong>管理服务</strong>{diagnostics.workbenchApi.url} · PID {diagnostics.workbenchApi.pid}</span>
+        <span><strong>当前构建</strong>v{diagnostics.workbenchApi.version || '未知'} · {diagnostics.workbenchApi.buildFingerprint || '无指纹'} · {diagnostics.workbenchApi.packaged ? '桌面安装包' : '源码开发版'}</span>
+        <span><strong>构建时间</strong>{diagnostics.workbenchApi.buildTime ? new Date(diagnostics.workbenchApi.buildTime).toLocaleString() : '未知'}</span>
         <span><strong>Hermes Home</strong>{diagnostics.hermesHome.path} · {diagnostics.hermesHome.profileCount} profiles</span>
         <span><strong>Frakio Work Home</strong>{diagnostics.frakioWorkHome?.path || '~/.frakio-work'}</span>
         <span><strong>运行 Runtime</strong>{diagnostics.agentRoot.path || '未定位'}</span>
@@ -7493,6 +7555,9 @@ function SettingsPage({ vaults, models, agents, hermesStatus, hermesBootstrap, h
               <label>上下文压缩阈值<input type="number" value={uiSettings.contextTriggerTokens || 500000} onChange={(event) => onUpdateUi({ contextTriggerTokens: Number(event.target.value) })} /></label>
               <label>群聊触发 Token<input type="number" value={uiSettings.groupChatTriggerTokens || 100000} onChange={(event) => onUpdateUi({ groupChatTriggerTokens: Number(event.target.value) })} /></label>
               <label>历史尾部消息数<input type="number" value={uiSettings.historyTailMessages || 10} onChange={(event) => onUpdateUi({ historyTailMessages: Number(event.target.value) })} /></label>
+              <label>Agent 间 @ 路由上限<select value={uiSettings.agentMentionMaxDepth === 'unlimited' ? 'unlimited' : 'fixed'} onChange={(event) => onUpdateUi({ agentMentionMaxDepth: event.target.value === 'unlimited' ? 'unlimited' : (typeof uiSettings.agentMentionMaxDepth === 'number' ? uiSettings.agentMentionMaxDepth : 2) })}><option value="fixed">固定次数</option><option value="unlimited">无限制</option></select></label>
+              {uiSettings.agentMentionMaxDepth !== 'unlimited' && <label>最多转发次数<input type="number" min="0" step="1" value={typeof uiSettings.agentMentionMaxDepth === 'number' ? uiSettings.agentMentionMaxDepth : 2} onChange={(event) => onUpdateUi({ agentMentionMaxDepth: Math.max(0, Math.floor(Number(event.target.value) || 0)) })} /></label>}
+              <p className="preference-help">无限制仍会阻止重复循环，并在单轮达到 64 次 Agent 运行时自动停止。</p>
             </div>
             <div className="settings-section-head"><h3>左侧置顶</h3></div>
             <div className="pin-grid">
@@ -9695,7 +9760,7 @@ function MentionTextarea({ value, onChange, onSend, sendKey, agents, selectedAge
       }
       if (/\s/.test(char || '')) break;
     }
-    if (atPos === -1 || (atPos > 0 && !/\s/.test(nextValue[atPos - 1] || ''))) {
+    if (atPos === -1 || (atPos > 0 && /[A-Za-z0-9_]/.test(nextValue[atPos - 1] || ''))) {
       setMentionActive(false);
       return;
     }
@@ -10817,15 +10882,8 @@ function buildMentionOptions(agents: Agent[], selectedAgentIds: string[], query:
   return options;
 }
 
-const mentionBeforeBoundaryChars = new Set(['(', '[', '{', '<']);
-const mentionAfterBoundaryChars = new Set(['.', ',', '!', '?', ';', ':', '，', '。', '！', '？', '；', '：', ')', ']', '}', '>']);
-
 function isMentionBeforeBoundary(char: string | undefined) {
-  return char === undefined || /\s/.test(char) || mentionBeforeBoundaryChars.has(char);
-}
-
-function isMentionAfterBoundary(char: string | undefined) {
-  return char === undefined || /\s/.test(char) || mentionAfterBoundaryChars.has(char);
+  return char === undefined || !/[A-Za-z0-9_]/.test(char);
 }
 
 function mentionIndex(content: string, mentionName: string) {
@@ -10839,7 +10897,10 @@ function mentionIndex(content: string, mentionName: string) {
     const atIndex = lower.indexOf(needle, fromIndex);
     if (atIndex === -1) return -1;
     const end = atIndex + needle.length;
-    if (isMentionBeforeBoundary(raw[atIndex - 1]) && isMentionAfterBoundary(raw[end])) return atIndex;
+    const aliasEnd = name[name.length - 1];
+    const after = raw[end];
+    const validEnd = after === undefined || !(/[A-Za-z0-9_]/.test(aliasEnd || '') && /[A-Za-z0-9_]/.test(after));
+    if (isMentionBeforeBoundary(raw[atIndex - 1]) && validEnd) return atIndex;
     fromIndex = atIndex + 1;
   }
   return -1;
@@ -10858,6 +10919,46 @@ function resolveRunTarget(message: string, agents: Agent[], fallbackAgent: Agent
   if (allIndex >= 0 && (!firstAgentMatch || allIndex <= firstAgentMatch.index)) return { kind: 'all', agent: fallbackAgent };
   if (firstAgentMatch) return { kind: 'agent', agent: firstAgentMatch.agent };
   return fallbackAgent ? { kind: 'agent', agent: fallbackAgent } : null;
+}
+
+function resolveMentionedRunAgents(message: string, agents: Agent[], selectedAgentIds: string[], senderAgentId = ''): Agent[] {
+  const raw = String(message || '');
+  const lower = raw.toLowerCase();
+  const selectedSet = new Set(selectedAgentIds);
+  const candidates = agents.flatMap((agent) => [agent.name, agent.id, agent.profileName]
+    .filter((alias): alias is string => Boolean(alias))
+    .map((alias) => ({ agent, alias, lower: alias.toLowerCase() })))
+    .sort((a, b) => b.alias.length - a.alias.length);
+  const result: Agent[] = [];
+  const seen = new Set<string>();
+  for (let atIndex = lower.indexOf('@'); atIndex >= 0; atIndex = lower.indexOf('@', atIndex + 1)) {
+    if (!isMentionBeforeBoundary(raw[atIndex - 1])) continue;
+    const tail = lower.slice(atIndex + 1);
+    if (tail.startsWith('all') && !(/[A-Za-z0-9_]/.test(raw[atIndex + 4] || ''))) {
+      for (const agent of agents) {
+        if (agent.id === senderAgentId || seen.has(agent.id)) continue;
+        seen.add(agent.id);
+        result.push(agent);
+      }
+      continue;
+    }
+    const match = candidates.find(({ alias, lower: aliasLower }) => {
+      if (!tail.startsWith(aliasLower)) return false;
+      const after = raw[atIndex + alias.length + 1];
+      return after === undefined || !(/[A-Za-z0-9_]/.test(alias[alias.length - 1] || '') && /[A-Za-z0-9_]/.test(after));
+    });
+    if (!match || match.agent.id === senderAgentId || seen.has(match.agent.id)) continue;
+    seen.add(match.agent.id);
+    result.push(match.agent);
+  }
+  return result;
+}
+
+function stripAgentMentionTokens(message: string, agent: Agent) {
+  const aliases = [agent.name, agent.id, agent.profileName].filter((alias): alias is string => Boolean(alias)).sort((a, b) => b.length - a.length);
+  let result = String(message || '');
+  for (const alias of ['all', ...aliases]) result = result.replace(new RegExp(`@${String(alias).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'ig'), '');
+  return result.replace(/^[\s,\uff0c:\uff1a;\uff1b.!?\u3002\uff01\uff1f]+/, '').replace(/[\s,\uff0c:\uff1a;\uff1b]+$/g, '').trim();
 }
 
 function pruneAgentModelOverrides(overrides: AgentModelOverrides, agents: Agent[], models: ModelProfile[]) {

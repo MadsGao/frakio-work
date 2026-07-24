@@ -24,6 +24,7 @@ import { resolveInsideRoot } from './lib/path-boundary.mjs';
 import { resolveCommand as resolvePlatformCommand, runtimeNodeCandidate, runtimePlatformDir, runtimePythonCandidates, runtimePythonSitePackagesCandidates } from './lib/platform.mjs';
 import { capabilitiesForModels, mapRunSettings, normalizeCapabilityOverrides, resolveModelCapability } from './lib/model-capabilities.mjs';
 import { createModelRunDiagnostic, finishModelRunDiagnostic, markModelRunSent } from './lib/model-run-diagnostics.mjs';
+import { isMentionNamePresent, mentionDepthAllows, normalizeAgentMentionMaxDepth, registerMentionEdge, resolveMentionedAgents, stripMentionRoutingTokens } from './lib/mention-routing.mjs';
 import { CHAT_THINKING_FORMATS, candidateModelUrls, directHttpRequestOverrides } from './lib/provider-adapters.mjs';
 import { catalogStatus, flattenProviderCatalog, parseCatalogResponse, parseModelIds, readCatalogCache, recordActiveProbeCapability, recordCatalogError, updateProviderCatalog, verificationKey, writeCatalogCache } from './lib/model-catalog-store.mjs';
 import { extractChatGptAccountId, fetchCodexOAuthCatalog } from './lib/oauth-provider-catalog.mjs';
@@ -761,7 +762,7 @@ function runTelemetryProperties(thread) {
 function defaultState() {
   return {
     version: 2,
-    ui: { libraryCollapsed: false, pinnedNav: defaultPinnedNav, defaultAgentId: '', defaultModel: '', density: 'comfortable', streamingResponses: true, showReasoning: true, telemetryEnabled: false, telemetryNoticeSeenAt: '' },
+    ui: { libraryCollapsed: false, pinnedNav: defaultPinnedNav, defaultAgentId: '', defaultModel: '', density: 'comfortable', streamingResponses: true, showReasoning: true, telemetryEnabled: false, telemetryNoticeSeenAt: '', agentMentionMaxDepth: 2 },
     userProfile: { avatarUrl: '', nickname: '', bio: '', age: '', hobbies: '', occupation: '', defaultAgentAddress: '', otherAgentAddress: '', completedAt: '', updatedAt: '' },
     observability: { modelUsage: [], modelRuns: [], systemEvents: [] },
     integrations: {
@@ -993,7 +994,15 @@ function normalizeState(state) {
         },
       },
     },
-    ui: { ...base.ui, ...(state.ui || {}), activeSpaceId, defaultAgentId, defaultModel, pinnedNav: { ...defaultPinnedNav, ...(state.ui?.pinnedNav || {}) } },
+    ui: {
+      ...base.ui,
+      ...(state.ui || {}),
+      activeSpaceId,
+      defaultAgentId,
+      defaultModel,
+      agentMentionMaxDepth: normalizeAgentMentionMaxDepth(state.ui?.agentMentionMaxDepth, 2),
+      pinnedNav: { ...defaultPinnedNav, ...(state.ui?.pinnedNav || {}) },
+    },
     userProfile: normalizeUserProfile(state.userProfile || base.userProfile),
     observability: {
       modelUsage: Array.isArray(state.observability?.modelUsage) ? state.observability.modelUsage.slice(-800) : [],
@@ -1065,7 +1074,7 @@ function normalizeCollaboration(collaboration = {}, fallback = {}) {
     lastMentionedAgentId: collaboration.lastMentionedAgentId || null,
     lastMentionedAgentName: collaboration.lastMentionedAgentName || '',
     activeAgentId: collaboration.activeAgentId || fallback.activeAgentId || fallback.defaultAgentId || null,
-    maxMentionDepth: Number.isFinite(Number(collaboration.maxMentionDepth)) ? Number(collaboration.maxMentionDepth) : 2,
+    maxMentionDepth: normalizeAgentMentionMaxDepth(collaboration.maxMentionDepth, 2),
     lastRoutedAt: collaboration.lastRoutedAt || null,
     lastRouteReason: collaboration.lastRouteReason || '',
   };
@@ -3389,7 +3398,7 @@ async function hermesRuntimeStatus() {
 }
 
 async function hermesRuntimeDiagnostics() {
-  const [profiles, bridge, runtimeApi, bridgeScript, python, agentRoot, tools, runtime] = await Promise.all([
+  const [profiles, bridge, runtimeApi, bridgeScript, python, agentRoot, tools, runtime, appVersion, serverFileStat] = await Promise.all([
     readHermesProfiles(),
     probeHermesBridge({ timeoutMs: 1000 }),
     probeHermesAgentApi(),
@@ -3398,7 +3407,11 @@ async function hermesRuntimeDiagnostics() {
     findHermesAgentRoot(),
     runtimeToolDiagnostics(),
     findFrakioHermesRuntime(),
+    readFrakioPackageVersion(),
+    stat(fileURLToPath(import.meta.url)).catch(() => null),
   ]);
+  const buildTime = String(process.env.FRAKIO_WORK_BUILD_TIME || serverFileStat?.mtime?.toISOString?.() || '');
+  const buildFingerprint = createHash('sha256').update(`${appVersion}|${buildTime}|${appRoot}`).digest('hex').slice(0, 12);
   const profileGateways = [];
   for (const profile of profiles.slice(0, 24)) {
     profileGateways.push(await profileGatewayStatus(profile.name));
@@ -3410,6 +3423,10 @@ async function hermesRuntimeDiagnostics() {
       url: `http://127.0.0.1:${port}`,
       pid: process.pid,
       port,
+      version: appVersion,
+      buildTime,
+      buildFingerprint,
+      packaged: process.env.FRAKIO_WORK_PACKAGED === '1',
     },
     frakioWorkHome: {
       path: frakioWorkHome,
@@ -8589,6 +8606,7 @@ app.patch('/api/state/ui', async (req, res) => {
   if ('activeSpaceId' in next && !state.spaces.some((space) => space.id === next.activeSpaceId && !space.archivedAt)) delete next.activeSpaceId;
   if ('telemetryEnabled' in next) next.telemetryEnabled = Boolean(next.telemetryEnabled);
   if ('telemetryNoticeSeenAt' in next) next.telemetryNoticeSeenAt = String(next.telemetryNoticeSeenAt || '').slice(0, 40);
+  if ('agentMentionMaxDepth' in next) next.agentMentionMaxDepth = normalizeAgentMentionMaxDepth(next.agentMentionMaxDepth, 2);
   state.ui = { ...state.ui, ...next };
   await writeState(state);
   if ('telemetryEnabled' in next) await telemetry.setEnabled(next.telemetryEnabled);
@@ -9305,49 +9323,12 @@ function detectTaskType(_message) {
   return 'council';
 }
 
-const MENTION_BEFORE_BOUNDARY = new Set(['(', '[', '{', '<']);
-const MENTION_AFTER_BOUNDARY = new Set(['.', ',', '!', '?', ';', ':', '，', '。', '！', '？', '；', '：', ')', ']', '}', '>']);
-
-function isMentionBeforeBoundary(char) {
-  return char === undefined || /\s/.test(char) || MENTION_BEFORE_BOUNDARY.has(char);
-}
-
-function isMentionAfterBoundary(char) {
-  return char === undefined || /\s/.test(char) || MENTION_AFTER_BOUNDARY.has(char);
-}
-
-function isMentionNamePresent(content, mentionName) {
-  const raw = String(content || '');
-  const name = String(mentionName || '').trim();
-  if (!raw || !name) return false;
-  const lower = raw.toLowerCase();
-  const needle = `@${name.toLowerCase()}`;
-  let fromIndex = 0;
-  while (fromIndex < lower.length) {
-    const atIndex = lower.indexOf(needle, fromIndex);
-    if (atIndex === -1) return false;
-    const end = atIndex + needle.length;
-    if (isMentionBeforeBoundary(raw[atIndex - 1]) && isMentionAfterBoundary(raw[end])) return true;
-    fromIndex = atIndex + 1;
-  }
-  return false;
-}
-
 function isAllAgentsMentioned(message) {
   return isMentionNamePresent(message, 'all');
 }
 
 function matchMentionedAgents(message, agents, selectedAgentIds = [], fallbackAgentId = '') {
-  if (isAllAgentsMentioned(message)) {
-    const selectedSet = new Set(selectedAgentIds);
-    const selectedAgents = agents.filter((agent) => selectedSet.has(agent.id));
-    const fallbackAgent = agents.find((agent) => agent.id === fallbackAgentId);
-    return selectedAgents.length ? selectedAgents : [fallbackAgent || agents[0]].filter(Boolean);
-  }
-  return agents.filter((agent) => {
-    const names = [agent.name, agent.id, agent.profileName].filter(Boolean);
-    return names.some((name) => isMentionNamePresent(message, name));
-  });
+  return resolveMentionedAgents(message, agents, { selectedAgentIds, fallbackAgentId });
 }
 
 function agentEvent(agent, content, extra = {}) {
@@ -9542,33 +9523,59 @@ async function runAgentRoomChat(req, res) {
   const events = [];
   let engine = 'workspace-group';
   let providerNotice = '';
+  const turnId = id('turn');
+  const maxMentionDepth = normalizeAgentMentionMaxDepth(state.ui?.agentMentionMaxDepth, 2);
+  const routedEdges = new Set();
+  let totalRoutedRuns = 0;
+  let routeLimitReached = false;
 
-  async function invokeAgent(agent, prompt, routeLabel = '') {
-    if (!agent) return;
+  async function invokeAgent(agent, prompt, routeLabel = '', mentionDepth = 0, parentMessageId = userMessage.id, routeReason = initialRoute.reason) {
+    if (!agent || totalRoutedRuns >= 64) {
+      routeLimitReached = true;
+      return null;
+    }
+    totalRoutedRuns += 1;
+    let event;
     try {
       const reply = await runConfiguredModelChat(state, { ...thread, messages: [...thread.messages, userMessage, ...events] }, prompt, [agent.id]);
-      events.push(agentEvent(agent, reply.content, { role: `${agent.role}${routeLabel} / ${reply.provider} / ${reply.modelId}` }));
+      event = agentEvent(agent, reply.content, { role: `${agent.role}${routeLabel} / ${reply.provider} / ${reply.modelId}`, turnId, mentionDepth, parentMessageId, routeReason });
     } catch (error) {
       providerNotice ||= String(error?.message || error);
-      events.push(agentEvent(agent, buildAgentReply(agent.id, prompt, taskType, summary), { role: `${agent.role}${routeLabel}` }));
+      event = agentEvent(agent, buildAgentReply(agent.id, prompt, taskType, summary), { role: `${agent.role}${routeLabel}`, turnId, mentionDepth, parentMessageId, routeReason });
       engine = 'simulate';
     }
+    events.push(event);
     if (!activeAgentIds.includes(agent.id)) activeAgentIds.push(agent.id);
+    return event;
   }
 
-  await invokeAgent(initialRoute.agent, message);
-
-  const seenRoutedAgentIds = new Set(activeAgentIds);
-  for (let depth = 0; depth < Math.max(0, collaboration.maxMentionDepth); depth += 1) {
-    const routedFromAgentReplies = events
-      .flatMap((event) => matchMentionedAgents(event.content, state.agents, activeAgentIds, resolveDefaultAgentId(state)))
-      .filter((agent) => !seenRoutedAgentIds.has(agent.id));
-    if (!routedFromAgentReplies.length) break;
-    for (const agent of routedFromAgentReplies) {
-      seenRoutedAgentIds.add(agent.id);
-      const relayMessage = `${events.at(-1)?.agentName || 'Agent'} 在聊天中 @${agent.name}，请基于当前上下文补充你的判断。`;
-      await invokeAgent(agent, relayMessage, ' / agent @ routing');
+  const initialAgents = initialRoute.mentionedAgents.length ? initialRoute.mentionedAgents : [initialRoute.agent].filter(Boolean);
+  let currentWave = (await Promise.all(initialAgents.map((agent) => invokeAgent(agent, message)))).filter(Boolean);
+  let handoffDepth = 1;
+  while (currentWave.length && mentionDepthAllows(handoffDepth, maxMentionDepth) && totalRoutedRuns < 64) {
+    const nextByAgentId = new Map();
+    for (const sourceEvent of currentWave) {
+      const targets = resolveMentionedAgents(sourceEvent.content, state.agents, {
+        senderAgentId: sourceEvent.agentId,
+        selectedAgentIds: activeAgentIds,
+        fallbackAgentId: resolveDefaultAgentId(state),
+      });
+      for (const target of targets) {
+        if (!registerMentionEdge(routedEdges, sourceEvent.agentId, target.id)) continue;
+        nextByAgentId.set(target.id, { target, sourceEvent });
+      }
     }
+    if (!nextByAgentId.size) break;
+    currentWave = (await Promise.all([...nextByAgentId.values()].map(({ target, sourceEvent }) => {
+      const routedText = stripMentionRoutingTokens(sourceEvent.content, target) || sourceEvent.content;
+      const relayMessage = `群聊系统：${sourceEvent.agentName} 在对话中提及了你（${target.name}），请基于当前上下文直接回复。\n\n原始消息：${routedText}`;
+      return invokeAgent(target, relayMessage, ' / agent @ routing', handoffDepth, sourceEvent.id, 'agent_mention');
+    }))).filter(Boolean);
+    handoffDepth += 1;
+  }
+  if (totalRoutedRuns >= 64) routeLimitReached = true;
+  if (routeLimitReached) {
+    events.push({ id: id('msg'), agentId: 'system', agentName: '系统', role: 'System', content: '本轮 Agent @ 路由已达到 64 次安全上限，后续提及已停止。', turnId, routeReason: 'mention_limit' });
   }
 
   const proposals = [
@@ -9604,6 +9611,7 @@ async function runAgentRoomChat(req, res) {
     providerError: providerNotice || '',
     collaboration: normalizeCollaboration({
       ...collaboration,
+      maxMentionDepth,
       activeAgentId: nextActiveAgent?.id || collaboration.activeAgentId,
       lastMentionedAgentId: lastMentioned?.id || collaboration.lastMentionedAgentId,
       lastMentionedAgentName: lastMentioned?.name || collaboration.lastMentionedAgentName,
@@ -9615,10 +9623,10 @@ async function runAgentRoomChat(req, res) {
 
   if (thread.title === '新的团队议事' || thread.title === '新的对话' || thread.title === 'Frakio 博客优化') thread.title = message.slice(0, 24) || thread.title;
   await writeState(state);
-  res.json({ taskType, thread, contextPacket, events, proposals, workflow, vaultSummary: summary, notice: providerNotice ? `${providerNotice}。已回退到本地 Agent 编排。` : '' });
+  res.json({ taskType, turnId, thread, contextPacket, events, proposals, workflow, vaultSummary: summary, notice: providerNotice ? `${providerNotice}。已回退到本地 Agent 编排。` : '' });
 }
 
-async function threadHistoryForHermes(thread) {
+async function threadHistoryForHermes(thread, targetAgent = null) {
   const messages = (thread.messages || [])
     .filter((message) => message.agentId !== 'system' && (message.content || message.attachments?.length))
     .slice(-20);
@@ -9631,11 +9639,29 @@ async function threadHistoryForHermes(thread) {
         return attachment;
       }
     }));
-    return {
-      role: message.agentId === 'user' ? 'user' : 'assistant',
-      content: hermesStoredMessageContent(message.content, attachments),
-    };
+    const storedContent = hermesStoredMessageContent(message.content, attachments);
+    if (message.agentId === targetAgent?.id) return { role: 'assistant', content: storedContent };
+    if (message.agentId === 'user') return { role: 'user', content: `[用户]\n${storedContent}` };
+    return { role: 'user', content: `[Agent ${message.agentName || message.agentId || '未知'}]\n${storedContent}` };
   }));
+}
+
+function agentIdentityRunInstruction(agent, agents = []) {
+  const roster = agents
+    .filter((item) => item?.id && item.id !== agent?.id)
+    .map((item) => `${item.name}（${item.role || 'Agent'}）`)
+    .join('、');
+  return [
+    `群聊身份规则：你是 ${agent?.name || '当前 Agent'}（${agent?.role || 'Agent'}）。`,
+    '只能以你自己的身份发言。不得替其他 Agent 写台词，不得使用“某某说：”模拟其他成员已经回复，也不得声称其他 Agent 已经在线或已经说过某句话。',
+    '如果需要其他 Agent 接话，只输出一条简短交接，并在正文中写出准确的 @AgentName。系统会真正唤醒对方并以对方自己的头像发送独立消息。',
+    `当前可交接成员：${roster || '无'}。`,
+    '当用户用“叫/让/请某位 Agent 出来、回答、打招呼”等自然语言要求你召唤明确成员时，不要代答；请直接使用 @AgentName 交接。',
+  ].join('\n');
+}
+
+function hermesAgentSessionId(thread, agentId) {
+  return String(thread?.agentSessionIds?.[agentId] || `workbench-${thread.id}-${agentId}`);
 }
 
 function attachmentPromptLine(attachment) {
@@ -9828,6 +9854,24 @@ function clearHermesRunState(thread) {
   thread.activeRunAgentId = '';
   thread.activeRunMentionedAgentId = '';
   thread.activeRunRouteReason = '';
+  thread.activeRunMentionDepth = 0;
+  thread.activeRunParentMessageId = '';
+  thread.activeRunSourceAgentId = '';
+  thread.activeRunTurnId = '';
+}
+
+function finishActiveRunGroupChild(thread, runId, status = 'completed') {
+  if (!thread?.activeRunGroup) return;
+  const activeRuns = { ...(thread.activeRunGroup.activeRuns || {}) };
+  delete activeRuns[runId];
+  const hasActiveRuns = Object.keys(activeRuns).length > 0;
+  thread.activeRunGroup = {
+    ...thread.activeRunGroup,
+    activeRuns,
+    status: hasActiveRuns ? 'running' : status,
+    updatedAt: now(),
+    ...(hasActiveRuns ? {} : { completedAt: now() }),
+  };
 }
 
 function hermesChunkError(chunk) {
@@ -9854,8 +9898,20 @@ async function completeHermesRunFromOutput(threadId, runId, output, usage, res) 
     return { completed: true, failed: true, thread };
   }
   const thread = await appendHermesRunResult(threadId, output, runId, usage || {});
+  const completedMessage = thread?.messages?.find((message) => message.externalRunId === runId);
   captureTelemetry('agent_run_completed', runTelemetryProperties(telemetryThread));
-  writeHermesRunSse(res, { event: 'run.completed', runId, output, thread, timestamp: Date.now() / 1000 });
+  writeHermesRunSse(res, {
+    event: 'run.completed',
+    runId,
+    output,
+    thread,
+    turnId: completedMessage?.turnId || runId,
+    agentId: completedMessage?.agentId || '',
+    agentName: completedMessage?.agentName || '',
+    mentionDepth: Number(completedMessage?.mentionDepth || 0),
+    parentMessageId: completedMessage?.parentMessageId || '',
+    timestamp: Date.now() / 1000,
+  });
   return { completed: true, failed: false, thread };
 }
 
@@ -9868,6 +9924,7 @@ async function failHermesRunFromChunk(threadId, runId, errorMessage, res) {
   if (thread) {
     thread.runStatus = 'failed';
     finishStoredModelRun(state, { runId, threadId, status: 'failed', error: event.error });
+    finishActiveRunGroupChild(thread, runId, 'failed');
     clearHermesRunState(thread);
     thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'failed'), stepFromHermesEvent(event));
     thread.workflow = thread.workflowState.map((step) => step.title);
@@ -9921,6 +9978,7 @@ async function processHermesBridgeChunk({ threadId, runId, chunk, res, outputSta
           status: event.event === 'run.failed' ? 'failed' : 'cancelled',
           error: event.error || (event.event === 'run.cancelled' ? '用户已停止运行。' : ''),
         });
+        finishActiveRunGroupChild(thread, runId, event.event === 'run.failed' ? 'failed' : 'cancelled');
         clearHermesRunState(thread);
         thread.workflowState = closeOpenWorkflowSteps(thread.workflowState || [], event.event === 'run.failed' ? 'failed' : 'completed');
         thread.workflow = thread.workflowState.map((step) => step.title);
@@ -9966,11 +10024,20 @@ async function appendHermesRunResult(threadId, output, runId, usage = {}) {
   const explicitlyMentionedAgent = state.agents.find((item) => item.id === thread.activeRunMentionedAgentId) || null;
   const collaboration = normalizeCollaboration(thread.collaboration, { defaultAgentId: thread.defaultAgentId, activeAgentId: thread.activeAgentId });
   const nextActiveAgent = thread.followMode === 'conversation' ? agent : defaultAgent;
+  const runSessionId = thread.activeSessionId || hermesAgentSessionId(thread, agent.id);
+  const runTurnId = thread.activeRunTurnId || runId;
   const finalOutput = trimLeadingBlankLines(output);
   if (finalOutput && !(thread.messages || []).some((message) => message.externalRunId === runId)) {
     thread.messages = [
       ...(thread.messages || []),
-      agentEvent(agent, finalOutput, { role: `${agent.role || 'Agent'} / Hermes Agent`, externalRunId: runId }),
+      agentEvent(agent, finalOutput, {
+        role: `${agent.role || 'Agent'} / Hermes Agent`,
+        externalRunId: runId,
+        turnId: runTurnId,
+        mentionDepth: Number(thread.activeRunMentionDepth || 0),
+        parentMessageId: thread.activeRunParentMessageId || '',
+        routeReason: thread.activeRunRouteReason || '',
+      }),
     ];
   }
   thread.updatedAt = now();
@@ -9986,7 +10053,11 @@ async function appendHermesRunResult(threadId, output, runId, usage = {}) {
     lastRouteReason: explicitlyMentionedAgent ? 'user_mention' : thread.followMode === 'conversation' ? 'conversation_follow' : 'default_agent',
   }, { defaultAgentId: thread.defaultAgentId, activeAgentId: nextActiveAgent?.id });
   thread.engine = 'hermes-agent';
-  thread.externalSessionId = thread.externalSessionId || `workbench-${thread.id}`;
+  thread.agentSessionIds = { ...(thread.agentSessionIds || {}), [agent.id]: runSessionId };
+  thread.externalSessionId = thread.externalSessionId || hermesAgentSessionId(thread, defaultAgent.id);
+  if (thread.activeRunGroup?.turnId === runTurnId) {
+    finishActiveRunGroupChild(thread, runId, 'completed');
+  }
   thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'completed'), { title: '生成最终回复', status: 'completed', source: 'run', updatedAt: now() });
   thread.workflow = thread.workflowState.map((step) => step.title);
   finishStoredModelRun(state, { runId, threadId, status: 'completed', usage });
@@ -10055,6 +10126,7 @@ async function failHermesRun(threadId, runId, errorMessage, title = 'Hermes Agen
   if (thread) {
     thread.runStatus = 'failed';
     finishStoredModelRun(state, { runId, threadId, status: 'failed', error: errorMessage });
+    finishActiveRunGroupChild(thread, runId, 'failed');
     clearHermesRunState(thread);
     thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'failed'), { title, status: 'failed', source: 'run', detail: String(errorMessage || '').slice(0, 200), updatedAt: now() });
     thread.workflow = thread.workflowState.map((step) => step.title);
@@ -10118,8 +10190,17 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     const thread = state.threads.find((item) => item.id === req.params.id);
     if (!thread) return res.status(404).json({ error: '会话不存在。' });
     const message = String(req.body?.message || '').trim();
+    const turnId = String(req.body?.turnId || id('turn'));
     const attachmentMetadata = await attachmentStore.resolveMany(req.body?.attachmentIds);
     if (!message && !attachmentMetadata.length) return res.status(400).json({ error: '消息和附件不能同时为空。' });
+    const existingRunGroup = thread.activeRunGroup?.turnId === turnId ? thread.activeRunGroup : null;
+    const configuredDepth = existingRunGroup?.maxMentionDepth ?? normalizeAgentMentionMaxDepth(state.ui?.agentMentionMaxDepth, 2);
+    if (req.body?.sourceAgentId && req.body.sourceAgentId !== 'user') {
+      const requestedDepth = Math.max(0, Math.floor(Number(req.body?.mentionDepth || 0)));
+      if (configuredDepth !== 'unlimited' && requestedDepth > configuredDepth) {
+        return res.status(409).json({ error: 'Agent 间 @ 路由已达到当前深度上限。', code: 'AGENT_MENTION_DEPTH_LIMIT' });
+      }
+    }
     let bridge = null;
     try {
       const started = await startHermesBridge();
@@ -10136,7 +10217,17 @@ app.post('/api/threads/:id/runs', async (req, res) => {
     const routingMessage = message || '请查看并处理这些附件。';
     const mentionedAgents = matchMentionedAgents(routingMessage, state.agents, selected, resolveDefaultAgentId(state));
     const explicitlyMentionedPrimaryAgent = !isAllAgentsMentioned(message) && mentionedAgents.some((agent) => agent.id === primaryAgent.id);
+    const routeReason = req.body?.sourceAgentId
+      ? req.body.sourceAgentId === 'user' ? 'user_mention' : 'agent_mention'
+      : explicitlyMentionedPrimaryAgent
+        ? 'user_mention'
+        : thread.followMode === 'conversation' ? 'conversation_follow' : 'default_agent';
     const selectedAgentIds = Array.from(new Set([...selected, primaryAgent.id].filter((agentId) => state.agents.some((agent) => agent.id === agentId))));
+    const routeEdge = req.body?.sourceAgentId ? `${String(req.body.sourceAgentId)}->${primaryAgent.id}` : '';
+    const routedEdges = new Set(existingRunGroup?.routedEdges || []);
+    if (routeEdge && routedEdges.has(routeEdge)) return res.status(409).json({ error: '本轮已经执行过相同的 Agent @ 路由。', code: 'AGENT_MENTION_DUPLICATE_EDGE' });
+    if (Number(existingRunGroup?.totalRoutedRuns || 0) >= 64) return res.status(409).json({ error: '本轮 Agent @ 路由已达到 64 次安全上限。', code: 'AGENT_MENTION_RUN_LIMIT' });
+    if (routeEdge) routedEdges.add(routeEdge);
     const profileName = await resolveHermesProfileNameForAgent(primaryAgent);
     runProfileName = profileName;
     const runModel = await resolveThreadRunModelConfig(state, thread, primaryAgent, profileName);
@@ -10161,28 +10252,55 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       error.details = missingMcpCommands[0];
       throw error;
     }
-    const sessionId = thread.externalSessionId || `workbench-${thread.id}`;
+    const sessionId = hermesAgentSessionId(thread, primaryAgent.id);
     const userMessage = { id: id('msg'), agentId: 'user', agentName: '你', role: 'Workspace Owner', content: message, attachments: attachmentMetadata.map(attachmentStore.publicAttachment) };
-    await attachmentStore.claim(attachmentMetadata, thread.id, userMessage.id);
-    if (!(thread.messages || []).some((item) => item.content === message && item.agentId === 'user' && String(item.id).startsWith('local-'))) {
-      thread.messages = [...(thread.messages || []), userMessage];
+    const relayMessage = req.body?.sourceAgentId ? {
+      id: id('msg'),
+      agentId: String(req.body.sourceAgentId),
+      agentName: String(req.body.sourceAgentName || 'Agent'),
+      role: 'Agent mention relay',
+      content: message,
+      mentionDepth: Number(req.body.mentionDepth || 1),
+      parentMessageId: String(req.body.parentMessageId || ''),
+    } : null;
+    if (!relayMessage) {
+      await attachmentStore.claim(attachmentMetadata, thread.id, userMessage.id);
+      if (!(thread.messages || []).some((item) => item.content === message && item.agentId === 'user' && String(item.id).startsWith('local-'))) {
+        thread.messages = [...(thread.messages || []), userMessage];
+      }
     }
+    runDiagnosticId = id('model_run');
     thread.runStatus = 'running';
     thread.workflowState = [{ title: 'Hermes Agent 开始执行', status: 'running', source: 'run', detail: (message || attachmentMetadata.map((item) => item.name).join('、')).slice(0, 80), updatedAt: now() }];
     thread.workflow = thread.workflowState.map((step) => step.title);
     thread.selectedAgents = selectedAgentIds;
-    thread.externalSessionId = sessionId;
+    thread.agentSessionIds = { ...(thread.agentSessionIds || {}), [primaryAgent.id]: sessionId };
+    thread.externalSessionId = thread.externalSessionId || hermesAgentSessionId(thread, resolveThreadDefaultAgent(state, thread)?.id || primaryAgent.id);
     thread.activeRunId = '';
     thread.activeSessionId = sessionId;
     thread.activeRunStartedAt = now();
     thread.activeRunAgentId = primaryAgent.id;
-    thread.activeRunMentionedAgentId = explicitlyMentionedPrimaryAgent ? primaryAgent.id : '';
-    thread.activeRunRouteReason = explicitlyMentionedPrimaryAgent ? 'user_mention' : thread.followMode === 'conversation' ? 'conversation_follow' : 'default_agent';
+    thread.activeRunMentionedAgentId = explicitlyMentionedPrimaryAgent || req.body?.sourceAgentId ? primaryAgent.id : '';
+    thread.activeRunRouteReason = routeReason;
+    thread.activeRunMentionDepth = Number(req.body?.mentionDepth || 0);
+    thread.activeRunParentMessageId = String(req.body?.parentMessageId || '');
+    thread.activeRunSourceAgentId = String(req.body?.sourceAgentId || '');
+    thread.activeRunTurnId = turnId;
+    thread.activeRunGroup = {
+      turnId,
+      maxMentionDepth: configuredDepth,
+      depth: Math.max(Number(existingRunGroup?.depth || 0), Number(req.body?.mentionDepth || 0)),
+      routedEdges: [...routedEdges],
+      activeRuns: { ...(existingRunGroup?.activeRuns || {}), [runDiagnosticId]: { runId: '', sessionId, agentId: primaryAgent.id, agentName: primaryAgent.name, mentionDepth: Number(req.body?.mentionDepth || 0), parentMessageId: String(req.body?.parentMessageId || ''), status: 'starting' } },
+      totalRoutedRuns: Number(existingRunGroup?.totalRoutedRuns || 0) + 1,
+      status: 'running',
+      startedAt: existingRunGroup?.startedAt || now(),
+      updatedAt: now(),
+    };
     thread.runtime = 'hermes-bridge';
     thread.profileName = profileName;
     thread.bridgeEndpoint = bridge.endpoint;
     thread.updatedAt = now();
-    runDiagnosticId = id('model_run');
     appendModelRunDiagnostic(state, createModelRunDiagnostic({
       id: runDiagnosticId,
       createdAt: thread.activeRunStartedAt,
@@ -10199,13 +10317,14 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       const { filePath } = await attachmentStore.content(metadata.id);
       return { id: metadata.id, name: metadata.name, mime_type: metadata.mimeType, size: metadata.size, kind: metadata.kind, path: filePath };
     }));
+    const runtimeMessage = `${agentIdentityRunInstruction(primaryAgent, state.agents)}\n\n用户或群聊消息：\n${routingMessage}`;
     const started = await requestHermesBridge({
       action: 'chat',
       session_id: sessionId,
-      message: routingMessage,
+      message: runtimeMessage,
       storage_message: hermesStoredMessageContent(message, bridgeAttachments),
       attachments: bridgeAttachments,
-      conversation_history: await threadHistoryForHermes({ ...thread, messages: (thread.messages || []).slice(0, -1) }),
+      conversation_history: await threadHistoryForHermes({ ...thread, messages: relayMessage ? thread.messages : (thread.messages || []).slice(0, -1) }, primaryAgent),
       profile: profileName,
       model: runModel.model || undefined,
       provider: runModel.provider || undefined,
@@ -10225,8 +10344,18 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       threadAfterStart.activeRunId = started.run_id;
       threadAfterStart.activeSessionId = started.session_id || sessionId;
       threadAfterStart.activeRunAgentId = primaryAgent.id;
-      threadAfterStart.activeRunMentionedAgentId = explicitlyMentionedPrimaryAgent ? primaryAgent.id : '';
-      threadAfterStart.activeRunRouteReason = explicitlyMentionedPrimaryAgent ? 'user_mention' : thread.followMode === 'conversation' ? 'conversation_follow' : 'default_agent';
+      threadAfterStart.activeRunMentionedAgentId = explicitlyMentionedPrimaryAgent || req.body?.sourceAgentId ? primaryAgent.id : '';
+      threadAfterStart.activeRunRouteReason = routeReason;
+      threadAfterStart.activeRunMentionDepth = Number(req.body?.mentionDepth || 0);
+      threadAfterStart.activeRunParentMessageId = String(req.body?.parentMessageId || '');
+      threadAfterStart.activeRunTurnId = turnId;
+      threadAfterStart.agentSessionIds = { ...(threadAfterStart.agentSessionIds || {}), [primaryAgent.id]: started.session_id || sessionId };
+      if (threadAfterStart.activeRunGroup?.turnId === turnId) {
+        const activeRuns = { ...(threadAfterStart.activeRunGroup.activeRuns || {}) };
+        delete activeRuns[runDiagnosticId];
+        activeRuns[started.run_id] = { runId: started.run_id, sessionId: started.session_id || sessionId, agentId: primaryAgent.id, agentName: primaryAgent.name, mentionDepth: Number(req.body?.mentionDepth || 0), parentMessageId: String(req.body?.parentMessageId || ''), status: 'running' };
+        threadAfterStart.activeRunGroup = { ...threadAfterStart.activeRunGroup, activeRuns, status: 'running', updatedAt: sentAt };
+      }
       threadAfterStart.updatedAt = sentAt;
     }
     await writeState(stateAfterStart);
@@ -10234,7 +10363,7 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       agent_count: selectedAgentIds.length,
       attachment_count: attachmentMetadata.length,
       permission_mode: thread.permissionMode || req.body?.permissionMode || 'manual',
-      route_reason: explicitlyMentionedPrimaryAgent ? 'user_mention' : thread.followMode === 'conversation' ? 'conversation_follow' : 'default_agent',
+      route_reason: routeReason,
     });
     captureMeaningfulActivity('agent_run_started');
     res.status(202).json({
@@ -10254,6 +10383,11 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       speedMode: runMapping.effectiveServiceTier,
       capabilitySource: runCapability?.source || 'profile',
       bridge,
+      turnId,
+      agentId: primaryAgent.id,
+      agentName: primaryAgent.name,
+      mentionDepth: Number(req.body?.mentionDepth || 0),
+      parentMessageId: String(req.body?.parentMessageId || ''),
     });
   } catch (error) {
     const details = { ...hermesRuntimeErrorDetails(error, error.details?.profileName || runProfileName), ...(error.details || {}) };
@@ -10264,6 +10398,7 @@ app.post('/api/threads/:id/runs', async (req, res) => {
       finishStoredModelRun(state, { diagnosticId: runDiagnosticId, threadId: req.params.id, status: 'failed', error: enriched });
       if (thread?.runStatus === 'running') {
         thread.runStatus = 'failed';
+        finishActiveRunGroupChild(thread, runDiagnosticId, 'failed');
         clearHermesRunState(thread);
         thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'failed'), { title: 'Hermes Agent 启动失败', status: 'failed', source: 'run', detail: enriched.slice(0, 200), updatedAt: now() });
         thread.workflow = thread.workflowState.map((step) => step.title);
@@ -10318,6 +10453,7 @@ app.get('/api/threads/:id/runs/:runId/events', async (req, res) => {
       if (thread) {
         thread.runStatus = 'failed';
         finishStoredModelRun(state, { runId: req.params.runId, threadId: req.params.id, status: 'failed', error: formattedError });
+        finishActiveRunGroupChild(thread, req.params.runId, 'failed');
         clearHermesRunState(thread);
         thread.workflowState = mergeWorkflowStep(closeOpenWorkflowSteps(thread.workflowState || [], 'failed'), { title: 'Hermes Agent 运行失败', status: 'failed', source: 'run', detail: formattedError.slice(0, 200), updatedAt: now() });
         thread.workflow = thread.workflowState.map((step) => step.title);
@@ -10396,14 +10532,19 @@ app.post('/api/threads/:id/runs/:runId/stop', async (req, res) => {
     const state = await readState();
     const thread = state.threads.find((item) => item.id === req.params.id);
     if (!thread) return res.status(404).json({ error: '对话不存在。', resolved: false });
-    if (!thread.activeRunId || String(thread.activeRunId) !== String(req.params.runId)) {
+    const groupRuns = Object.values(thread.activeRunGroup?.activeRuns || {});
+    const requestedRun = groupRuns.find((run) => String(run.runId) === String(req.params.runId));
+    if ((!thread.activeRunId || String(thread.activeRunId) !== String(req.params.runId)) && !requestedRun) {
       return res.status(409).json({ error: '这次运行已经结束或无法停止', resolved: false });
     }
-    const sessionId = String(req.body?.sessionId || req.query.sessionId || `workbench-${req.params.id}`);
-    const result = await requestHermesBridge({ action: 'interrupt', session_id: sessionId, message: '用户请求停止。' }, { timeoutMs: 10000, retryMs: 1000 });
-    if (result?.resolved === false) return res.status(409).json({ error: '这次运行已经结束或无法停止', ...result });
+    const runsToStop = req.body?.childOnly
+      ? [requestedRun || { runId: req.params.runId, sessionId: req.body?.sessionId || req.query.sessionId || thread.activeSessionId }]
+      : (groupRuns.length ? groupRuns : [{ runId: req.params.runId, sessionId: req.body?.sessionId || req.query.sessionId || thread.activeSessionId }]);
+    const results = await Promise.allSettled(runsToStop.map((run) => requestHermesBridge({ action: 'interrupt', session_id: String(run.sessionId || ''), run_id: run.runId || undefined, message: '用户请求停止。' }, { timeoutMs: 10000, retryMs: 1000 })));
+    const stopped = results.filter((result) => result.status === 'fulfilled' && result.value?.resolved !== false).length;
+    if (!stopped) return res.status(409).json({ error: '这次运行已经结束或无法停止', resolved: false });
     captureTelemetry('agent_run_stopped', { duration_bucket: telemetryDurationBucket(thread.activeRunStartedAt) });
-    res.json({ ...result, ok: true, resolved: true });
+    res.json({ ok: true, resolved: true, stoppedRuns: stopped, turnId: thread.activeRunGroup?.turnId || '' });
   } catch (error) {
     const message = String(error?.message || '').trim();
     const expired = /unknown run|not found|expired|already (?:ended|finished)|not running|no active/i.test(message);
