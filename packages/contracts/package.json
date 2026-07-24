@@ -1,6 +1,6 @@
 {
   "name": "@frakio/contracts",
-  "version": "0.1.6",
+  "version": "0.1.7-beta",
   "private": true,
   "type": "module",
   "types": "./src/index.ts",

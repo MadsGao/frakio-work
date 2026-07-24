@@ -46,6 +46,15 @@ test('fresh install stays blank until Hermes profiles are explicitly synchronize
   assert.deepEqual(vaults.vaults, []);
   assert.equal(state.ui.defaultAgentId, '');
   assert.equal(state.ui.defaultModel, '');
+  assert.equal(state.ui.agentMentionMaxDepth, 2);
+
+  const mentionLimitResponse = await fetch(`${ctx.baseUrl}/api/state/ui`, {
+    method: 'PATCH',
+    headers: { ...ctx.writeHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ agentMentionMaxDepth: 'unlimited' }),
+  });
+  assert.equal(mentionLimitResponse.status, 200);
+  assert.equal((await mentionLimitResponse.json()).ui.agentMentionMaxDepth, 'unlimited');
 
   const importResponse = await fetch(`${ctx.baseUrl}/api/hermes-bootstrap/import`, { method: 'POST', headers: ctx.writeHeaders });
   assert.equal(importResponse.status, 200);
